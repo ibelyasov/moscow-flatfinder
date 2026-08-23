@@ -1,0 +1,1 @@
+"""Deterministic apartment-search automation."""

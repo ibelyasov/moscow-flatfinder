@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: macos-15
+    timeout-minutes: 35
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.5"
+          enable-cache: true
+          cache-dependency-glob: automation/uv.lock
+
+      - name: Install Python and dependencies
+        run: |
+          uv python install 3.13
+          uv sync --project automation --locked
+          uv run --project automation playwright install chromium
+
+      - name: Verify Python and CLI
+        env:
+          PYTHONPATH: automation
+        run: |
+          uv run --project automation python -m compileall -q automation/flatfinder
+          uv run --project automation python -c 'from flatfinder import admin, cli, export, extract, photos, pipeline, scoring, storage, vision'
+          uv run --project automation flatfinder --help
+          uv run --project automation python -c 'import sqlite3; from flatfinder.storage import migrate; c=sqlite3.connect(":memory:"); migrate(c); assert c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"; assert c.execute("PRAGMA user_version").fetchone()[0] == 16'
+          uv run --project automation python -c 'from flatfinder.cli import load_config; from flatfinder.scoring import score_maxima; c=load_config("automation/config.example.toml"); assert score_maxima(c.scoring_max_scores) == (39.0, 10.0, 49.0)'
+          git diff --check
+
+      - name: Scan complete history for secrets
+        run: |
+          brew install gitleaks
+          gitleaks git --redact --no-banner --log-opts="--all" .

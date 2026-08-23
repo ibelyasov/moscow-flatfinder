@@ -1,0 +1,39 @@
+# Private configuration and local credentials.
+/automation/config.toml
+**/config.toml
+
+# Runtime state and exports.
+/data/*
+!/data/.gitkeep
+*.sqlite3
+*.sqlite3-*
+*.lock
+!/automation/uv.lock
+/quality/vision-calibration-journal.json
+/quality/*manifest*.json
+
+# Browser profiles and logs.
+profiles/
+**/profiles/
+logs/
+**/logs/
+*.log
+
+# Local Python environments and caches.
+.venv/
+**/.venv/
+venv/
+**/venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# macOS/editor noise.
+.DS_Store
+.idea/
+.vscode/
+
+# Local procoder session state.
+.procoder/ask/
+.procoder/index/
+.procoder/state/

@@ -1,0 +1,16 @@
+---
+inclusion: always
+---
+
+# MoscowFlatFinder — Codex
+
+При настройке пользовательского поиска полностью следуй
+`docs/agent-onboarding.md`. Личные данные и runtime-файлы хранятся только вне Git
+в `~/Library/Application Support/MoscowFlatFinder`. Не запускай полный сбор,
+массовый Vision refresh или расписание без явного подтверждения пользователя.
+
+## Разработка
+
+- Do not add automated test files, test frameworks, or test dependencies to this project.
+- Verify changes with focused temporary/inline smoke checks plus the repository checks documented in `README.md`: `compileall`, production-module imports, CLI smoke checks, SQLite integrity, and `git diff --check`.
+- Do not commit temporary verification scripts or fixtures.
