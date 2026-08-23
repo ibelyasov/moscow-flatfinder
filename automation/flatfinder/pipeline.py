@@ -8,7 +8,9 @@ import inspect
 import json
 import math
 import re
+import sqlite3
 from collections.abc import Mapping, Sequence
+from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
@@ -16,11 +18,12 @@ from statistics import median
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from crawlee import ConcurrencySettings, Request
+from crawlee import ConcurrencySettings, Request, service_locator
 from crawlee.browsers import BrowserPool
 from crawlee.configuration import Configuration as CrawleeConfiguration
 from crawlee.crawlers import PlaywrightCrawler, PlaywrightCrawlingContext
-from crawlee.events import LocalEventManager
+from crawlee.errors import ServiceConflictError
+from crawlee.events import EventManager
 from crawlee.router import Router
 from crawlee.storage_clients import FileSystemStorageClient
 from crawlee.storages import RequestQueue
@@ -230,10 +233,22 @@ def _crawlee_storage_dir(config: Any) -> Path:
 
 
 def _crawlee_configuration(config: Any) -> CrawleeConfiguration:
-    return CrawleeConfiguration(
+    desired = CrawleeConfiguration(
         storage_dir=str(_crawlee_storage_dir(config)),
         purge_on_start=False,
     )
+    try:
+        service_locator.set_configuration(desired)
+        return desired
+    except ServiceConflictError:
+        current = service_locator.get_configuration()
+        if Path(str(current.storage_dir)).expanduser().resolve() != Path(
+            str(desired.storage_dir)
+        ).expanduser().resolve() or bool(current.purge_on_start):
+            raise RuntimeError(
+                "Crawlee is already configured for a different storage directory"
+            ) from None
+        return current
 
 
 def _build_crawler(
@@ -241,12 +256,13 @@ def _build_crawler(
     request_manager: RequestQueue,
     request_handler: Any,
     storage_client: FileSystemStorageClient,
+    crawlee_configuration: CrawleeConfiguration,
+    event_manager: EventManager,
 ) -> PlaywrightCrawler:
     """Construct the native persistent Crawlee runtime."""
 
     profile_dir = prepare_profile_dir(config)
     retries = max(0, int(_config(config, "network_retries", 2)))
-    crawlee_configuration = _crawlee_configuration(config)
     browser_pool = BrowserPool.with_default_plugin(
         browser_type="chromium",
         user_data_dir=profile_dir,
@@ -258,7 +274,7 @@ def _build_crawler(
     )
     return PlaywrightCrawler(
         configuration=crawlee_configuration,
-        event_manager=LocalEventManager.from_config(crawlee_configuration),
+        event_manager=event_manager,
         storage_client=storage_client,
         request_manager=request_manager,
         request_handler=request_handler,
@@ -285,7 +301,7 @@ async def _await(value: Any) -> Any:
 async def _goto(page: Any, url: str) -> None:
     goto = getattr(page, "goto", None)
     if not callable(goto):
-        raise RuntimeError("page does not support navigation")
+        raise TypeError("page does not support navigation")
     try:
         response = await _await(goto(url, wait_until="domcontentloaded"))
     except TypeError:
@@ -311,6 +327,8 @@ class BlockedRun(RuntimeError):
 
 @dataclass(slots=True)
 class DiscoveryResult:
+    """Marketplace discovery counters and normalized listing links."""
+
     cards_found: int = 0
     cards_new: int = 0
     cards_changed: int = 0
@@ -320,6 +338,8 @@ class DiscoveryResult:
 
 @dataclass(slots=True)
 class QueueResult:
+    """Detail-processing counters and non-fatal enrichment diagnostics."""
+
     status: str = "success"
     blocked_reason: str | None = None
     written_assessments: int = 0
@@ -340,6 +360,8 @@ class QueueResult:
 
 @dataclass(slots=True)
 class RunResult:
+    """Final persisted outcome returned by one configured source run."""
+
     run_id: int
     status: str
     blocked_reason: str | None = None
@@ -368,7 +390,7 @@ def _recent_coverages(conn: Any, parser_version: str) -> list[float]:
             "SELECT field_coverage FROM runs WHERE parser_version = ? AND field_coverage IS NOT NULL ORDER BY id DESC LIMIT 5",
             (str(parser_version),),
         ).fetchall()
-    except Exception:
+    except sqlite3.Error:
         return []
     values: list[float] = []
     for row in rows:
@@ -745,7 +767,10 @@ def run_listing_vision(
     except (TypeError, ValueError, json.JSONDecodeError) as error:
         raise ValueError(f"listing {listing_id} has invalid facts snapshot") from error
     if not isinstance(facts, Mapping):
-        raise ValueError(f"listing {listing_id} facts snapshot is not an object")
+        # Stored-payload validation intentionally uses the project's ValueError API.
+        raise ValueError(  # noqa: TRY004
+            f"listing {listing_id} facts snapshot is not an object"
+        )
     text_row = conn.execute(
         "SELECT text, quotes_json, content_sha256, captured_at FROM full_text WHERE listing_id = ?",
         (listing_id,),
@@ -887,7 +912,7 @@ def run_listing_vision(
             model_version=model_version,
             prompt_version=prompt_version,
         )
-    except Exception as error:
+    except (OSError, RuntimeError, TypeError, ValueError) as error:
         message = str(error)[:1000] or error.__class__.__name__
         finish_vision_run(conn, run_id, "failed", schema_valid=False, error=message)
         return VisionRunResult(
@@ -955,12 +980,20 @@ def run_listing_vision(
                         prompt_version,
                     ),
                 )
-    except Exception as error:
+    except (sqlite3.Error, OverflowError, RuntimeError, TypeError, ValueError) as error:
         message = str(error)[:1000] or error.__class__.__name__
         try:
             finish_vision_run(conn, run_id, "failed", schema_valid=False, error=message)
-        except Exception:
-            pass
+        except (
+            sqlite3.Error,
+            OverflowError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ) as persistence_error:
+            message = (
+                f"{message}; failure status persistence failed ({persistence_error})"
+            )
         return VisionRunResult(
             status="failed",
             proposals=[],
@@ -1117,7 +1150,9 @@ async def _enrich_top_candidates(
                 vision_contract=_config(config, "vision_contract"),
             )
             enriched += 1
-        except Exception as error:
+        # Network adapters and enrichment providers expose third-party errors;
+        # one bad candidate must be reported without aborting the remaining set.
+        except Exception as error:  # noqa: BLE001
             failed += 1
             errors.append(
                 f"listing {candidate['listing_id']}: enrichment failed ({error})"
@@ -1530,7 +1565,7 @@ def _record_commute_history(
 
     try:
         record_commute_check(conn, listing_id, payload)
-    except Exception as error:
+    except (sqlite3.Error, OverflowError, RuntimeError, TypeError, ValueError) as error:
         result.enrichment_errors.append(
             f"listing {listing_id}: commute history failed ({error})"
         )
@@ -1550,7 +1585,7 @@ def _record_park_history(
 
     try:
         record_park_check(conn, listing_id, payload)
-    except Exception as error:
+    except (sqlite3.Error, OverflowError, RuntimeError, TypeError, ValueError) as error:
         result.enrichment_errors.append(
             f"listing {listing_id}: park history failed ({error})"
         )
@@ -1563,7 +1598,7 @@ def _record_fitness_history(
 
     try:
         record_fitness_check(conn, listing_id, payload)
-    except Exception as error:
+    except (sqlite3.Error, OverflowError, RuntimeError, TypeError, ValueError) as error:
         result.enrichment_errors.append(
             f"listing {listing_id}: fitness history failed ({error})"
         )
@@ -1630,7 +1665,9 @@ async def _persist_listing_artifacts(
         if full_text.listing_id != listing_id:
             full_text = replace(full_text, listing_id=listing_id)
         upsert_full_text(conn, full_text)
-    except Exception as error:
+    # Source adapters combine Playwright and marketplace-specific parsers;
+    # full-text failure is non-fatal after the listing snapshot is durable.
+    except Exception as error:  # noqa: BLE001
         message = str(error)[:240] or error.__class__.__name__
         result.enrichment_errors.append(
             f"listing {listing_id}: full-text persistence failed ({message})"
@@ -1641,7 +1678,9 @@ async def _persist_listing_artifacts(
         photos = await ingest_photos(
             page, listing_id, photo_urls, _photo_cache_dir(config)
         )
-    except Exception as error:
+    # Photo ingestion crosses Playwright, HTTP, Pillow, and filesystem APIs;
+    # retain failed photo rows instead of losing the durable listing.
+    except Exception as error:  # noqa: BLE001
         message = str(error)[:240] or error.__class__.__name__
         fallback_urls = list(dict.fromkeys(str(url) for url in photo_urls if url))
         photos = [
@@ -1659,7 +1698,7 @@ async def _persist_listing_artifacts(
         upsert_photo_ingestion(conn, photos, listing_id=listing_id, replace=True)
         result.photos_processed += len(photos)
         detect_listing_duplicate(conn, listing_id)
-    except Exception as error:
+    except (sqlite3.Error, OverflowError, RuntimeError, TypeError, ValueError) as error:
         message = str(error)[:240] or error.__class__.__name__
         result.enrichment_errors.append(
             f"listing {listing_id}: photo persistence or duplicate detection failed ({message})"
@@ -1704,14 +1743,15 @@ async def _run_listing_vision_if_needed(
             parameters=_config(config, "scoring_parameters"),
             thresholds=_config(config, "scoring_thresholds"),
             hard_constraints=_config(config, "hard_constraints"),
-            vision_contract=_config(config, "vision_contract"),
         )
         if vision_result.status != "skipped":
             result.vision_attempts += 1
         if vision_result.status == "failed":
             result.vision_failed += 1
         result.visual_coverage = float(vision_result.visual_coverage) * 100.0
-    except Exception as error:
+    # Optional model providers can fail with provider-specific exception types;
+    # preserve the deterministic listing and expose the Vision failure.
+    except Exception as error:  # noqa: BLE001
         result.vision_failed += 1
         result.enrichment_errors.append(
             f"listing {listing_id}: vision failed ({error})"
@@ -1769,6 +1809,7 @@ async def _run_crawlee(
     adapter = adapter_for_search_url(search_url)
     recent_by_source = {adapter.source: _recent_coverages(conn, adapter.parser_version)}
     crawlee_configuration = _crawlee_configuration(config)
+    event_manager = service_locator.get_event_manager()
     storage_client = FileSystemStorageClient()
     request_manager = await RequestQueue.open(
         name="flatfinder-listings",
@@ -1929,7 +1970,9 @@ async def _run_crawlee(
                 result.blocked_reason = f"enrichment_failed: {failed}; {first_error}"
         except BlockedRun as error:
             await stop_blocked(error.reason, context.request)
-        except Exception as error:
+        # Final enrichment is a fail-closed boundary around multiple providers;
+        # every unexpected provider error must finish the run as failed.
+        except Exception as error:  # noqa: BLE001
             result.status = "failed"
             result.enrichment_failed = 1
             result.blocked_reason = f"enrichment_failed: {error}"
@@ -2008,7 +2051,14 @@ async def _run_crawlee(
             result.status = "failed"
             result.blocked_reason = str(error)
 
-    crawler = _build_crawler(config, request_manager, router, storage_client)
+    crawler = _build_crawler(
+        config,
+        request_manager,
+        router,
+        storage_client,
+        crawlee_configuration,
+        event_manager,
+    )
     if adapter.prepare_page is not None:
 
         async def prepare_source_page(context: Any) -> None:
@@ -2095,7 +2145,7 @@ async def run_once(
                     claude_bin=str(_config(config, "vision_claude_bin", "claude")),
                     timeout_seconds=int(_config(config, "vision_timeout_seconds", 900)),
                 )
-            except Exception:
+            except (OSError, RuntimeError, TypeError, ValueError):
                 vision_runtime = None
         discovery, queue = await _run_crawlee(
             config,
@@ -2119,7 +2169,9 @@ async def run_once(
         blocked_reason, status = error.reason, "blocked"
     except ParserDriftError as error:
         blocked_reason, status = f"parser_drift: {error}", "failed"
-    except Exception as error:
+    # This is the source-run boundary: unexpected crawler/provider failures
+    # must be persisted as failed instead of escaping before finish_run().
+    except Exception as error:  # noqa: BLE001
         blocked_reason, status = str(error), "failed"
     finally:
         try:
@@ -2155,10 +2207,8 @@ async def run_once(
             )
         finally:
             if vision_runtime is not None:
-                try:
+                with suppress(OSError, RuntimeError, TypeError, ValueError):
                     vision_runtime.close()
-                except Exception:
-                    pass
     return RunResult(
         run_id=run_id,
         status=status,
