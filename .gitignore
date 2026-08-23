@@ -37,3 +37,6 @@ __pycache__/
 .procoder/ask/
 .procoder/index/
 .procoder/state/
+
+# Personal Superset lifecycle overrides.
+.superset/config.local.json
