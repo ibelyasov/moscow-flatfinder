@@ -36,6 +36,14 @@ _NO_ROUTE_TEXT = (
     "маршрут не найден",
     "нет подходящего маршрута",
 )
+_HOUR_UNIT_PATTERN = r"(?:ч|час(?:а|ов)?|h(?:ours?|rs?)?)"
+_MINUTE_UNIT_PATTERN = r"(?:мин|min(?:utes?|s)?)"
+_DURATION_PATTERN = (
+    rf"(?:(\d+)\s*{_HOUR_UNIT_PATTERN}"
+    rf"(?:\s*(\d+)\s*{_MINUTE_UNIT_PATTERN})?|"
+    rf"(\d+)\s*{_MINUTE_UNIT_PATTERN})"
+)
+_DURATION_RE = re.compile(_DURATION_PATTERN, re.IGNORECASE)
 
 
 @dataclass(slots=True)
@@ -101,13 +109,9 @@ def build_route_url(
 
 
 def parse_duration_minutes(text: str) -> int | None:
-    """Parse the first Russian route duration from a route card."""
+    """Parse the first Russian or English route duration from a route card."""
 
-    match = re.search(
-        r"(?:(\d+)\s*(?:ч|час(?:а|ов)?)(?:\s*(\d+)\s*мин)?|(\d+)\s*мин)",
-        str(text or ""),
-        re.IGNORECASE,
-    )
+    match = _DURATION_RE.search(str(text or ""))
     if match is None:
         return None
     return int(match.group(1) or 0) * 60 + int(match.group(2) or match.group(3) or 0)
@@ -195,9 +199,14 @@ class YandexMapsRouter:
 
         global _last_navigation_at
         url = build_route_url(source, target, mode, at)
-        label = "На общественном транспорте" if mode == "transit" else "Пешком"
+        labels = (
+            ("На общественном транспорте", "By public transport", "Public transport")
+            if mode == "transit"
+            else ("Пешком", "Walking")
+        )
+        label_pattern = "|".join(re.escape(label) for label in labels)
         card_name = re.compile(
-            rf"{re.escape(label)}.*(?:\d+\s*ч)?\s*\d+\s*мин", re.IGNORECASE
+            rf"(?:{label_pattern}).*{_DURATION_PATTERN}", re.IGNORECASE
         )
         async with _ROUTE_LOCK:
             delay = (
