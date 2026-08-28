@@ -34,6 +34,7 @@ try:
         connect_db,
         migrate,
         set_listing_disliked,
+        set_listing_favorited,
         update_personal_score,
     )
 except ModuleNotFoundError:  # pragma: no cover - package execution fallback
@@ -45,6 +46,7 @@ except ModuleNotFoundError:  # pragma: no cover - package execution fallback
         connect_db,
         migrate,
         set_listing_disliked,
+        set_listing_favorited,
         update_personal_score,
     )
 
@@ -394,6 +396,7 @@ def _filtered(
     min_commute: float | None,
     max_commute: float | None,
     new_only: bool,
+    favorites_only: bool,
     show_basic: bool,
     show_hidden: bool,
     show_inactive: bool,
@@ -401,13 +404,18 @@ def _filtered(
 ) -> list[Mapping[str, Any]]:
     def included(item: Mapping[str, Any]) -> bool:
         hidden = bool(item.get("disliked_at"))
+        favorite = bool(item.get("favorited_at"))
         inactive = str(item.get("state") or "active") == "inactive"
         inactive_at = _datetime(item.get("inactive_at")) if inactive else None
-        inactive_allowed = not inactive or (
-            show_inactive
-            and (
-                inactive_since is None
-                or (inactive_at is not None and inactive_at >= inactive_since)
+        inactive_allowed = (
+            not inactive
+            or (favorites_only and favorite)
+            or (
+                show_inactive
+                and (
+                    inactive_since is None
+                    or (inactive_at is not None and inactive_at >= inactive_since)
+                )
             )
         )
         total = _num(item.get("estimated_monthly_total"))
@@ -415,8 +423,9 @@ def _filtered(
         commute = _num(item.get("average_commute_minutes"))
         return (
             (show_hidden or not hidden)
+            and (not favorites_only or favorite)
             and inactive_allowed
-            and (show_basic or hidden or inactive)
+            and (show_basic or hidden or inactive or (favorites_only and favorite))
             and (not new_only or bool(item.get("is_new")))
             and (min_total is None or (total is not None and total >= min_total))
             and (max_total is None or (total is not None and total <= max_total))
@@ -796,6 +805,7 @@ def _rows(listings: list[Mapping[str, Any]], base_url: str) -> list[dict[str, An
     return [
         {
             "ID": int(item["listing_id"]),
+            "♥": "♥" if item.get("favorited_at") else "",
             "Объявление": _listing_heading(item),
             "Открыть": f"{base_url.rstrip('/')}/?listing_id={int(item['listing_id'])}",
             "Площадь": _area(item.get("area_m2")),
@@ -900,13 +910,33 @@ def _write_disliked(config: Any, listing_id: int, disliked: bool) -> list[str]:
         conn.close()
 
 
+def _write_favorited(config: Any, listing_id: int, favorited: bool) -> list[str]:
+    conn = connect_db(_cfg(config, "database"))
+    try:
+        migrate(conn)
+        set_listing_favorited(conn, listing_id, favorited)
+        try:
+            export_json(
+                conn,
+                _cfg(config, "json_export"),
+                max_scores=_cfg(config, "scoring_max_scores", {}),
+                scoring_parameters=_cfg(config, "scoring_parameters", {}),
+                vision_contract=_cfg(config, "vision_contract"),
+            )
+        except Exception as exc:
+            return [f"JSON-экспорт: {str(exc)[:500] or exc.__class__.__name__}"]
+        return []
+    finally:
+        conn.close()
+
+
 def _render_listing_summary(
     item: Mapping[str, Any],
     total_max: int,
     park: Mapping[str, Any],
     fitness: Mapping[str, Any],
     criteria: Mapping[str, Any],
-) -> None:
+) -> bool:
     with st.container(border=True, key="flatfinder-listing-summary"):
         heading, actions = st.columns([6, 4], vertical_alignment="center")
         with heading:
@@ -942,6 +972,12 @@ def _render_listing_summary(
                     "needs_review": "orange",
                     "rejected": "red",
                 }.get(eligibility, "gray"),
+            )
+            favorite = bool(item.get("favorited_at"))
+            favorite_clicked = st.button(
+                "♥ В избранном" if favorite else "♡ В избранное",
+                key=f"favorite-{item['listing_id']}",
+                type="primary" if favorite else "secondary",
             )
             source_offers = _items(item.get("source_offers")) or [item]
             valid_sources = [
@@ -1014,6 +1050,7 @@ def _render_listing_summary(
                         else ""
                     )
                     st.caption(f"{name} · {minutes}{rating_text}{sauna}")
+    return favorite_clicked
 
 
 def _render_photo_gallery(config: Any, item: Mapping[str, Any]) -> None:
@@ -1233,7 +1270,25 @@ def _render_listing(
     ]
     park = _map(item.get("park"))
     fitness = _map(item.get("fitness"))
-    _render_listing_summary(item, total_max, park, fitness, criteria)
+    favorite_clicked = _render_listing_summary(item, total_max, park, fitness, criteria)
+    if favorite_clicked:
+        favorite = bool(item.get("favorited_at"))
+        try:
+            errors = _write_favorited(config, int(item["listing_id"]), not favorite)
+        except Exception as exc:
+            st.error(str(exc)[:500] or exc.__class__.__name__)
+        else:
+            st.cache_data.clear()
+            text = (
+                "Квартира удалена из избранного."
+                if favorite
+                else "Квартира добавлена в избранное."
+            )
+            st.session_state["_flatfinder_notice"] = (
+                text + (" " + "; ".join(errors) if errors else ""),
+                bool(errors),
+            )
+            st.rerun()
     _render_photo_gallery(config, item)
     personal_score, save_score, dislike_clicked, disliked = _render_decision_controls(
         item, total_max, float(_num(rubric.get("personal_max"), 0) or 0)
@@ -1439,6 +1494,8 @@ def main() -> None:
         placeholder="Любое",
         key="max-commute",
     )
+    favorites_count = sum(bool(item.get("favorited_at")) for item in listings)
+    favorites_only = st.sidebar.checkbox(f"Только избранное ({favorites_count})")
     new_only = st.sidebar.checkbox("Только новые")
     show_hidden = st.sidebar.checkbox("Показывать скрытые")
     inactive_scope = st.sidebar.selectbox(
@@ -1465,6 +1522,7 @@ def main() -> None:
         min_commute=min_commute,
         max_commute=max_commute,
         new_only=new_only,
+        favorites_only=favorites_only,
         show_basic=show_basic,
         show_hidden=show_hidden,
         show_inactive=show_inactive,
@@ -1473,12 +1531,13 @@ def main() -> None:
     visible = filtered
     st.title("Квартиры к просмотру")
     st.caption(f"Выпуск: {_date(payload.get('updated_at'))}")
-    cols = st.columns(4)
+    cols = st.columns(5)
     for col, label, value in zip(
         cols,
-        ("Показано", "Приоритет", "Новые", "Источников"),
+        ("Показано", "Избранное", "Приоритет", "Новые", "Источников"),
         (
             len(filtered),
+            sum(bool(i.get("favorited_at")) for i in visible),
             sum(_status(i.get("status")) == "priority" for i in visible),
             sum(bool(i.get("is_new")) for i in visible),
             len({i.get("source") for i in visible if i.get("source")}),
@@ -1486,7 +1545,10 @@ def main() -> None:
     ):
         col.metric(label, value)
     if not filtered:
-        st.warning("Фильтр ничего не нашёл.")
+        if favorites_only and favorites_count == 0:
+            st.info("В избранном пока ничего нет.")
+        else:
+            st.warning("Фильтр ничего не нашёл.")
         return
     base_url = str(st.context.url)
     view = st.segmented_control(
@@ -1503,6 +1565,7 @@ def main() -> None:
     table = _rows(filtered, base_url)
     table_config = {
         "ID": None,
+        "♥": st.column_config.TextColumn(width="small"),
         "Объявление": st.column_config.TextColumn(width="large"),
         "Открыть": st.column_config.LinkColumn(display_text="Открыть ↗", width="small"),
         "Площадь": st.column_config.TextColumn(width="small"),

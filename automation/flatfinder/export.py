@@ -350,6 +350,7 @@ def _listing_payload(
     contact_sheet = _facts_value(facts, "contact_sheet", "contact_sheet_path")
     personal_rated_at = row["personal_rated_at"] or None
     disliked_at = row["disliked_at"] or None
+    favorited_at = row["favorited_at"] or None
     commute_payload = latest_commute_check(conn, listing_id)
     commute = (
         None
@@ -472,7 +473,10 @@ def _listing_payload(
         "inactive_at": str(row["inactive_at"] or ""),
         "personal_rated_at": personal_rated_at,
         "disliked_at": disliked_at,
-        "is_new": personal_rated_at is None and disliked_at is None,
+        "favorited_at": favorited_at,
+        "is_new": (
+            personal_rated_at is None and disliked_at is None and favorited_at is None
+        ),
         "facts": facts,
         "field_values": field_values,
         "assessment": assessment,
@@ -535,7 +539,7 @@ def dashboard_payload(
                s.captured_at, s.facts_json,
                a.auto_score, a.personal_score, a.total_score, a.completeness,
                a.fact_coverage, a.visual_coverage, a.status, a.assessment_json,
-               a.personal_rated_at, a.disliked_at,
+               a.personal_rated_at, a.disliked_at, a.favorited_at,
                a.updated_at AS assessment_updated_at, l.vision_content_hash,
                d.canonical_listing_id, d.method AS duplicate_method,
                d.confidence AS duplicate_confidence,
@@ -571,7 +575,7 @@ def dashboard_payload(
         _listing_payload(conn, row, vision_contract, scoring_parameters) for row in rows
     ]
     return {
-        "version": 6,
+        "version": 7,
         "rubric": rubric,
         "updated_at": max(
             (item.get("updated_at", "") for item in listings), default=""

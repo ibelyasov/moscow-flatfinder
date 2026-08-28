@@ -190,6 +190,7 @@ _SCHEMA = (
       visual_coverage REAL NOT NULL DEFAULT 0,
       personal_rated_at TEXT,
       disliked_at TEXT,
+      favorited_at TEXT,
       status TEXT NOT NULL,
       assessment_json TEXT NOT NULL,
       updated_at TEXT NOT NULL
@@ -515,7 +516,7 @@ def connect_db(path: str | Path) -> sqlite3.Connection:
 
 
 def migrate(conn: sqlite3.Connection) -> None:
-    """Create schema 16 or migrate the one supported predecessor."""
+    """Create schema 17 or migrate a supported predecessor."""
 
     if conn.in_transaction:
         raise sqlite3.OperationalError("migrate requires a clean connection")
@@ -525,11 +526,11 @@ def migrate(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA busy_timeout=5000")
     conn.execute("PRAGMA journal_mode=WAL")
     current = int(conn.execute("PRAGMA user_version").fetchone()[0])
-    if current == 16:
+    if current == 17:
         return
-    if current not in {0, 15}:
+    if current not in {0, 15, 16}:
         raise RuntimeError(
-            f"unsupported database schema version: {current}; expected 15 or 16"
+            f"unsupported database schema version: {current}; expected 15, 16, or 17"
         )
     with _write_transaction(conn):
         if current == 15:
@@ -539,10 +540,12 @@ def migrate(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE vision_runs ADD COLUMN reasoning_effort TEXT NOT NULL DEFAULT 'medium'"
             )
+        if current in {15, 16}:
+            conn.execute("ALTER TABLE assessments ADD COLUMN favorited_at TEXT")
         else:
             for statement in _SCHEMA:
                 conn.execute(statement)
-        conn.execute("PRAGMA user_version = 16")
+        conn.execute("PRAGMA user_version = 17")
 
 
 def _photo_values(photo: Any) -> tuple[str, str | None, str | None, str | None, int]:
@@ -2808,12 +2811,45 @@ def set_listing_disliked(
         listing_id = int(row["listing_id"] if isinstance(row, sqlite3.Row) else row[0])
         now = _now()
         conn.execute(
-            "UPDATE assessments SET disliked_at = ?, updated_at = ? WHERE listing_id = ?",
-            (now if disliked else None, now, listing_id),
+            """
+            UPDATE assessments
+            SET disliked_at = ?, favorited_at = CASE WHEN ? THEN NULL ELSE favorited_at END,
+                updated_at = ?
+            WHERE listing_id = ?
+            """,
+            (now if disliked else None, disliked, now, listing_id),
         )
         updated = conn.execute(
             "SELECT * FROM assessments WHERE listing_id = ?", (listing_id,)
         ).fetchone()
         if updated is None:
             raise sqlite3.IntegrityError("listing dislike update did not return a row")
+    return updated
+
+
+def set_listing_favorited(
+    conn: sqlite3.Connection, identifier: int | str, favorited: bool
+) -> sqlite3.Row:
+    """Add or remove one listing from favorites, restoring it when added."""
+
+    if not isinstance(favorited, bool):
+        raise ValueError("favorited must be a boolean")
+    with _write_transaction(conn):
+        row = _personal_assessment_row(conn, identifier)
+        listing_id = int(row["listing_id"] if isinstance(row, sqlite3.Row) else row[0])
+        now = _now()
+        conn.execute(
+            """
+            UPDATE assessments
+            SET favorited_at = ?, disliked_at = CASE WHEN ? THEN NULL ELSE disliked_at END,
+                updated_at = ?
+            WHERE listing_id = ?
+            """,
+            (now if favorited else None, favorited, now, listing_id),
+        )
+        updated = conn.execute(
+            "SELECT * FROM assessments WHERE listing_id = ?", (listing_id,)
+        ).fetchone()
+        if updated is None:
+            raise sqlite3.IntegrityError("listing favorite update did not return a row")
     return updated
