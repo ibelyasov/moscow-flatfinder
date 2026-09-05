@@ -33,10 +33,5 @@ __pycache__/
 .idea/
 .vscode/
 
-# Local procoder session state.
-.procoder/ask/
-.procoder/index/
-.procoder/state/
-
 # Personal Superset lifecycle overrides.
 .superset/config.local.json

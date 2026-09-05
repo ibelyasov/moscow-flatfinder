@@ -172,11 +172,6 @@ sqlite3 "$HOME/Library/Application Support/MoscowFlatFinder/data/listings.sqlite
 git diff --check
 ```
 
-The repository also includes an optional
-[Procoder](https://github.com/azrtydxb/procoder) layer for keeping agent
-instructions in sync and running pre-commit checks. It is not required to use
-MoscowFlatFinder.
-
 </details>
 
 ## Status and license
