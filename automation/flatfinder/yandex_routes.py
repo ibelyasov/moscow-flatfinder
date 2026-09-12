@@ -199,15 +199,10 @@ class YandexMapsRouter:
 
         global _last_navigation_at
         url = build_route_url(source, target, mode, at)
-        labels = (
-            ("На общественном транспорте", "By public transport", "Public transport")
-            if mode == "transit"
-            else ("Пешком", "Walking")
-        )
-        label_pattern = "|".join(re.escape(label) for label in labels)
-        card_name = re.compile(
-            rf"(?:{label_pattern}).*{_DURATION_PATTERN}", re.IGNORECASE
-        )
+        duration_selector = {
+            "transit": ".masstransit-route-snippet-view__route-duration",
+            "walking": ".pedestrian-route-snippet-view__duration",
+        }[mode]
         async with _ROUTE_LOCK:
             delay = (
                 _last_navigation_at
@@ -234,9 +229,11 @@ class YandexMapsRouter:
                 if blocker:
                     await self._capture_failure(blocker)
                     raise YandexMapsRouteError(blocker)
-                cards = self.page.get_by_role("listitem", name=card_name)
-                await cards.first.wait_for(state="visible", timeout=self.timeout_ms)
-                text = await cards.first.inner_text()
+                duration = self.page.locator(duration_selector)
+                await duration.first.wait_for(
+                    state="visible", timeout=self.timeout_ms
+                )
+                text = await duration.first.inner_text()
                 minutes = parse_duration_minutes(text)
                 if minutes is None:
                     await self._capture_failure("schema-changed")

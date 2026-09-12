@@ -1832,6 +1832,9 @@ async def _run_crawlee(
         try:
             request_search_url = str(context.request.url)
             request_adapter = adapter_for_search_url(request_search_url)
+            if request_adapter.source != adapter.source:
+                context.request.no_retry = True
+                return
             declared_source = str(
                 (getattr(context.request, "user_data", None) or {}).get("source", "")
             ).strip()
@@ -1883,6 +1886,9 @@ async def _run_crawlee(
         request_url = str(context.request.url)
         try:
             request_adapter = adapter_for_listing_url(request_url)
+            if request_adapter.source != adapter.source:
+                context.request.no_retry = True
+                return
             declared_source = str(user_data.get("source", "")).strip()
             if declared_source and declared_source != request_adapter.source:
                 raise ParserDriftError(

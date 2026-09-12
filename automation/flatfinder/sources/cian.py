@@ -138,6 +138,7 @@ _DETAIL_SCRIPT = r"""() => {
       } : null,
       totalArea: offer.totalArea,
       roomsCount: offer.roomsCount,
+      flatType: offer.flatType,
       floorNumber: offer.floorNumber,
       repairType: offer.repairType,
       isApartments: offer.isApartments,
@@ -372,7 +373,11 @@ def facts_from_payload(
             _number(offer.get("totalArea")), "CIAN offer.totalArea", captured_at
         ),
         "rooms": _field(
-            _number(offer.get("roomsCount")), "CIAN offer.roomsCount", captured_at
+            0
+            if offer.get("flatType") == "studio"
+            else _number(offer.get("roomsCount")),
+            "CIAN offer.roomsCount/flatType",
+            captured_at,
         ),
         "floor": _field(
             _number(offer.get("floorNumber")), "CIAN offer.floorNumber", captured_at
