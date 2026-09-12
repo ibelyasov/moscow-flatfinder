@@ -14,7 +14,6 @@ from typing import Any
 import tomllib
 
 from .models import (
-    VISION_RUBRIC_VERSION,
     VISION_SCHEMA_VERSION,
     FullTextRecord,
     PhotoInput,
@@ -23,11 +22,14 @@ from .models import (
     VisionProposal,
     validate_visual_payload,
 )
+from .vision_contract import (
+    DEFAULT_VISION_CONTRACT,
+    PRODUCTION_PASS_CRITERIA,
+    PRODUCTION_PASSES,
+)
 
-MODEL_NAME = "gpt-5.6-luna"
-DEFAULT_PROMPT_VERSION = VISION_RUBRIC_VERSION
-PRODUCTION_PASS_CRITERIA = {"visual": ("owner_visual_assessment",)}
-PRODUCTION_PASSES = tuple(PRODUCTION_PASS_CRITERIA)
+MODEL_NAME = DEFAULT_VISION_CONTRACT.model_name
+DEFAULT_PROMPT_VERSION = DEFAULT_VISION_CONTRACT.prompt_version
 
 
 def _component_schema(maximum: int, *, repair: bool = False) -> dict[str, Any]:

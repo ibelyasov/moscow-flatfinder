@@ -12,25 +12,15 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote_plus
 
-from .models import (
-    VISION_SCHEMA_VERSION,
-    Evidence,
-    FieldValue,
-    ListingFacts,
-    ValueStatus,
-)
-from .scoring import (
-    _decode_proposal,
-    apply_validated_vision,
-    criterion_input_hashes,
-    evaluate_hard_constraints,
-    reuse_unchanged_criteria,
-    score_bucket,
-    score_listing,
-    score_maxima,
-    score_total,
-)
+from .assessment import evaluate_listing, facts_model, normalize_facts
+from .models import FieldValue, ListingFacts, ValueStatus
+from .queries import assessment_row, latest_facts_row, validated_vision_proposal_rows
+from .scoring import _decode_proposal, apply_validated_vision
 from .storage import persist_enrichment_bundle, visual_score_input_hash
+from .vision_contract import (
+    PRODUCTION_PASS_CRITERIA,
+)
+from .vision_contract import vision_contract as resolve_vision_contract
 
 _VALID_STATUS = {item.value for item in ValueStatus}
 _BLOCKER_RE = re.compile(
@@ -44,36 +34,6 @@ _RISK_PATTERNS = {
     "construction": r"(?:стройк|ремонт дороги|construction)",
     "nightlife": r"(?:ночн(?:ой|ые)|клуб|бар|night ?club|late[- ]night)",
 }
-_CRITERION_FIELDS = {
-    "noise": ("noise",),
-    "park": ("park",),
-    "equipment": (
-        "appliances",
-        "equipment",
-        "furnished",
-        "bed",
-        "fridge",
-        "washer",
-        "ac",
-        "dishwasher",
-    ),
-    "repair": ("repair",),
-    "price": ("price_monthly", "price", "commission", "utilities"),
-    "commute": ("route_minutes", "route"),
-    "area": ("area_m2",),
-    "visual_layout": ("layout",),
-    "floor": ("floor", "total_floors"),
-    "light_view": ("light_view",),
-    "building": ("building_year",),
-    "fitness": ("fitness",),
-}
-_BASE_CRITERION_FIELDS = {
-    **_CRITERION_FIELDS,
-    "equipment": ("appliances", "equipment"),
-    "floor": ("floor", "total_floors"),
-}
-
-
 @dataclass(frozen=True, slots=True)
 class EnvironmentResult:
     noise_risks: list[str]
@@ -135,80 +95,6 @@ def _evidence_list(value: Any, source: str = "snapshot") -> list[dict[str, Any]]
             )
         else:
             result.append({"source": source, "detail": str(item), "captured_at": ""})
-    return result
-
-
-def normalize_facts(
-    payload: Mapping[str, Any],
-    source_listing_id: str = "",
-    source_url: str = "",
-    *,
-    source: str | None = None,
-) -> dict[str, Any]:
-    """Normalize the current canonical snapshot contract.
-
-    ``source`` is part of the trust boundary: old snapshots without it must
-    fail closed instead of being silently classified as Yandex listings.
-    Callers that already know the source may pass it explicitly while loading
-    a legacy-shaped payload; a conflicting payload value is still rejected.
-    """
-    if not isinstance(payload, Mapping) or not isinstance(
-        payload.get("fields"), Mapping
-    ):
-        raise ValueError("canonical facts require a fields object")
-    data = json.loads(json.dumps(dict(payload), ensure_ascii=False))
-    payload_source = data.get("source")
-    explicit_source = None
-    if source is not None:
-        if not isinstance(source, str) or not source.strip():
-            raise ValueError("canonical facts source must be non-empty text")
-        explicit_source = source.strip()
-    if payload_source in (None, ""):
-        source_value = explicit_source
-    else:
-        if not isinstance(payload_source, str) or not payload_source.strip():
-            raise ValueError("canonical facts source must be non-empty text")
-        source_value = payload_source.strip()
-        if explicit_source is not None and source_value != explicit_source:
-            raise ValueError("canonical facts source conflicts with its context")
-    if source_value is None:
-        raise ValueError("canonical facts require a non-empty source")
-    raw_fields = data["fields"]
-    fields: dict[str, dict[str, Any]] = {}
-    for name, raw in raw_fields.items():
-        if not isinstance(raw, Mapping):
-            raise ValueError(f"canonical field {name!r} must be an object")
-        field_value = dict(raw)
-        field_value["status"] = _status(
-            field_value.get("status"),
-            ValueStatus.CONFIRMED.value
-            if field_value.get("value") is not None
-            else ValueStatus.UNKNOWN.value,
-        )
-        field_value["evidence"] = _evidence_list(
-            field_value.get("evidence"), "snapshot"
-        )
-        fields[str(name)] = field_value
-    result = {
-        key: value
-        for key, value in data.items()
-        if key not in {"fields", "source_listing_id", "source_url"}
-    }
-    result["source_listing_id"] = str(
-        data.get("source_listing_id") or source_listing_id
-    )
-    result["source_url"] = str(data.get("source_url") or source_url)
-    result["source"] = source_value
-    result["fields"] = fields
-    route = fields.get("route")
-    if "route_minutes" not in fields and isinstance(route, Mapping):
-        route_value = route.get("value")
-        if isinstance(route_value, Mapping) and route_value.get("minutes") is not None:
-            fields["route_minutes"] = {
-                "value": route_value["minutes"],
-                "status": route.get("status", ValueStatus.CONFIRMED.value),
-                "evidence": list(route.get("evidence", [])),
-            }
     return result
 
 
@@ -510,43 +396,10 @@ def apply_enrichment(
     return result
 
 
-def _facts_model(payload: Mapping[str, Any]) -> ListingFacts:
-    normalized = normalize_facts(payload)
-    fields: dict[str, FieldValue] = {}
-    for name, raw in normalized["fields"].items():
-        value = raw.get("value") if isinstance(raw, Mapping) else raw
-        state = _status(raw.get("status") if isinstance(raw, Mapping) else None)
-        evidence = []
-        for item in _field_evidence(raw, state):
-            evidence.append(
-                Evidence(
-                    str(item.get("source", "snapshot")),
-                    str(item.get("detail", "")),
-                    str(item.get("captured_at", "")),
-                )
-            )
-        fields[str(name)] = FieldValue(value, ValueStatus(state), evidence)
-    return ListingFacts(
-        str(normalized.get("source_listing_id", "")),
-        str(normalized.get("source_url", "")),
-        fields,
-        str(normalized["source"]),
-    )
-
-
 def _latest_facts(
     conn: sqlite3.Connection, listing_id: int
 ) -> tuple[dict[str, Any], int]:
-    row = conn.execute(
-        """
-        SELECT s.id, s.facts_json, l.source
-        FROM listing_snapshots AS s
-        JOIN listings AS l ON l.id = s.listing_id
-        WHERE s.listing_id = ?
-        ORDER BY s.id DESC LIMIT 1
-        """,
-        (int(listing_id),),
-    ).fetchone()
+    row = latest_facts_row(conn, listing_id)
     if row is None:
         raise ValueError(f"listing {listing_id} has no facts snapshot")
     try:
@@ -558,10 +411,7 @@ def _latest_facts(
 def _existing_assessment(
     conn: sqlite3.Connection, listing_id: int
 ) -> tuple[dict[str, Any], float, float, float, str]:
-    row = conn.execute(
-        "SELECT assessment_json, personal_score, completeness, total_score, status FROM assessments WHERE listing_id = ?",
-        (int(listing_id),),
-    ).fetchone()
+    row = assessment_row(conn, listing_id)
     if row is None:
         return {}, 0.0, 0.0, 0.0, "reserve"
     try:
@@ -585,54 +435,14 @@ def _apply_validated_proposals(
 ) -> ListingFacts:
     """Feed the current validated Vision assessment into scoring."""
 
-    from .storage import _current_vision_contract
-    from .vision import PRODUCTION_PASS_CRITERIA
-
-    provider, model_name, reasoning_effort, prompt_version = (
-        vision_contract or _current_vision_contract()
+    provider, model_name, reasoning_effort, prompt_version = resolve_vision_contract(
+        vision_contract
+    ).as_tuple()
+    proposals = validated_vision_proposal_rows(
+        conn,
+        listing_id,
+        (provider, model_name, reasoning_effort, prompt_version),
     )
-    proposals = conn.execute(
-        """
-        WITH current_runs AS (
-          SELECT vr.id,
-                 ROW_NUMBER() OVER (ORDER BY vr.id DESC) AS run_rank
-          FROM vision_runs AS vr
-          JOIN listings AS l ON l.id = vr.listing_id
-          WHERE vr.listing_id = ?
-            AND vr.status = 'success'
-            AND vr.schema_valid = 1
-            AND vr.provider = ?
-            AND vr.model_name = ?
-            AND vr.model_version = ?
-            AND vr.reasoning_effort = ?
-            AND vr.prompt_version = ?
-            AND l.vision_content_hash IS NOT NULL
-            AND vr.content_hash = l.vision_content_hash
-        )
-        SELECT vp.*
-        FROM vision_proposals AS vp
-        JOIN current_runs AS cr ON cr.id = vp.vision_run_id AND cr.run_rank = 1
-        WHERE vp.listing_id = ?
-          AND vp.review_status = 'validated'
-          AND vp.result_status = 'category'
-          AND vp.model_name = ?
-          AND vp.model_version = ?
-          AND vp.prompt_version = ?
-        ORDER BY id
-        """,
-        (
-            int(listing_id),
-            provider,
-            model_name,
-            model_name,
-            reasoning_effort,
-            prompt_version,
-            int(listing_id),
-            model_name,
-            model_name,
-            prompt_version,
-        ),
-    ).fetchall()
     filtered_proposals: list[dict[str, Any]] = []
     for item in proposals:
         row = dict(item)
@@ -650,108 +460,10 @@ def _apply_validated_proposals(
         if decoded is not None:
             filtered_proposals.append(decoded)
     proposals = filtered_proposals
-    model = _facts_model(normalized)
+    model = facts_model(normalized)
     if not proposals:
         return model
     return apply_validated_vision(model, proposals)
-
-
-def _fact_fields(facts: Mapping[str, Any] | ListingFacts) -> Mapping[str, Any]:
-    if isinstance(facts, ListingFacts):
-        return facts.fields
-    if isinstance(facts, Mapping):
-        fields = facts.get("fields", {})
-        return fields if isinstance(fields, Mapping) else {}
-    return {}
-
-
-def _assessment_field_evidence(
-    raw: Any, *, nested: bool = False
-) -> list[dict[str, Any]]:
-    evidences = _field_evidence(raw, _field_status(raw))
-    if not nested:
-        return evidences
-    value = (
-        raw.value
-        if isinstance(raw, FieldValue)
-        else raw.get("value")
-        if isinstance(raw, Mapping)
-        else None
-    )
-    if isinstance(value, Mapping):
-        for child in value.values():
-            evidences.extend(_field_evidence(child, _field_status(child)))
-    return evidences
-
-
-def _assessment_for(
-    facts: Mapping[str, Any] | ListingFacts,
-    scores: dict[str, float],
-    previous: Mapping[str, Any],
-) -> dict[str, Any]:
-    fields = _fact_fields(facts)
-    score_view = isinstance(facts, ListingFacts)
-    criterion_fields = _CRITERION_FIELDS if score_view else _BASE_CRITERION_FIELDS
-    result: dict[str, Any] = {}
-    for criterion, score in scores.items():
-        if criterion == "personal":
-            continue
-        evidences: list[dict[str, Any]] = []
-        for name in criterion_fields.get(criterion, ()):
-            raw = fields.get(name) if isinstance(fields, Mapping) else None
-            if raw is not None:
-                field_evidence = _assessment_field_evidence(
-                    raw, nested=score_view and criterion == "equipment"
-                )
-                if score_view and criterion == "light_view":
-                    if not any(
-                        str(item.get("source", "")).startswith("vision:")
-                        for item in field_evidence
-                    ):
-                        continue
-                evidences.extend(field_evidence)
-        if not evidences and isinstance(previous.get(criterion), Mapping):
-            old = previous[criterion]
-            evidences = _evidence_list(old.get("evidence"), "previous_assessment")
-            old_confidence = _status(old.get("confidence"), ValueStatus.UNKNOWN.value)
-        else:
-            old_confidence = ""
-        confidence_values = {
-            str(item.get("confidence", ValueStatus.UNKNOWN.value)) for item in evidences
-        }
-        confidence = old_confidence or (
-            ValueStatus.CONFIRMED.value
-            if confidence_values == {ValueStatus.CONFIRMED.value}
-            else ValueStatus.UNKNOWN.value
-            if confidence_values
-            <= {ValueStatus.UNKNOWN.value, ValueStatus.ABSENT.value}
-            else ValueStatus.PARTIAL.value
-        )
-        result[criterion] = {
-            "score": float(score),
-            "evidence": evidences,
-            "confidence": confidence,
-        }
-        component_name = {
-            "repair": "repair",
-            "visual_layout": "layout",
-            "light_view": "light_view",
-        }.get(criterion)
-        if component_name and score_view:
-            raw = fields.get(criterion)
-            payload = raw.value if isinstance(raw, FieldValue) else None
-            if (
-                isinstance(payload, Mapping)
-                and payload.get("schema_version") == VISION_SCHEMA_VERSION
-            ):
-                result[criterion]["details"] = json.loads(
-                    json.dumps(payload[component_name], ensure_ascii=False)
-                )
-    if isinstance(previous.get("personal"), Mapping):
-        result["personal"] = json.loads(
-            json.dumps(previous["personal"], ensure_ascii=False)
-        )
-    return result
 
 
 def _build_bundle(
@@ -770,43 +482,31 @@ def _build_bundle(
     previous, personal, completeness, _old_total, _old_status = _existing_assessment(
         conn, listing_id
     )
-    facts_model = _facts_model(normalized)
+    model = facts_model(normalized)
     if vision_scoring_enabled:
-        facts_model = _apply_validated_proposals(
+        model = _apply_validated_proposals(
             conn, listing_id, normalized, vision_contract
         )
-    scores = score_listing(
-        facts_model, {}, max_scores=max_scores, parameters=parameters
-    )
-    assessment = _assessment_for(
-        facts_model if vision_scoring_enabled else normalized, scores, previous
-    )
-    assessment["eligibility"] = evaluate_hard_constraints(
-        facts_model, hard_constraints, parameters
-    )
-    scores, assessment = reuse_unchanged_criteria(
-        scores,
-        assessment,
+    result = evaluate_listing(
+        model,
         previous,
-        criterion_input_hashes(
-            normalized,
-            visual_hash=visual_score_input_hash(conn, listing_id, vision_contract),
-            max_scores=max_scores,
-            parameters=parameters,
-        ),
+        personal,
         max_scores=max_scores,
+        parameters=parameters,
+        thresholds=thresholds,
+        hard_constraints=hard_constraints,
+        visual_hash=visual_score_input_hash(conn, listing_id, vision_contract),
+        vision_scoring_enabled=vision_scoring_enabled,
+        vision_contract=vision_contract,
     )
-    auto_score = sum(value for name, value in scores.items() if name != "personal")
-    automatic_max, _personal_max, _total_max = score_maxima(max_scores)
-    total = score_total(list(scores.values()), automatic_max) + personal
     return (
         normalized,
-        assessment,
-        float(auto_score),
-        float(total),
-        float(personal),
+        result.assessment,
+        result.auto_score,
+        result.total,
+        result.personal_score,
         float(completeness),
-        score_bucket(auto_score, thresholds),
+        result.status,
     )
 
 

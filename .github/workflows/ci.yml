@@ -13,8 +13,13 @@ concurrency:
 
 jobs:
   verify:
+    name: Verify Python ${{ matrix.python }}
     runs-on: macos-15
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.12", "3.13", "3.14"]
 
     steps:
       - name: Checkout full history
@@ -26,14 +31,14 @@ jobs:
       - name: Install pinned uv
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: "0.12.5"
+          version: "0.12.13"
           enable-cache: true
           cache-dependency-glob: automation/uv.lock
 
       - name: Install Python and dependencies
         run: |
-          uv python install 3.13
-          uv sync --project automation --locked
+          uv python install ${{ matrix.python }}
+          uv sync --project automation --locked --python ${{ matrix.python }}
           uv run --project automation playwright install chromium
 
       - name: Verify Python and CLI
@@ -41,13 +46,15 @@ jobs:
           PYTHONPATH: automation
         run: |
           uv run --project automation python -m compileall -q automation/flatfinder
-          uv run --project automation python -c 'from flatfinder import admin, cli, export, extract, photos, pipeline, scoring, storage, vision'
+          uv run --project automation python -c 'import importlib, pkgutil, flatfinder; [importlib.import_module(m.name) for m in pkgutil.walk_packages(flatfinder.__path__, flatfinder.__name__ + ".")]'
           uv run --project automation flatfinder --help
-          uv run --project automation python -c 'import sqlite3; from flatfinder.storage import migrate; c=sqlite3.connect(":memory:"); migrate(c); assert c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"; assert c.execute("PRAGMA user_version").fetchone()[0] == 16'
-          uv run --project automation python -c 'from flatfinder.cli import load_config; from flatfinder.scoring import score_maxima; c=load_config("automation/config.example.toml"); assert score_maxima(c.scoring_max_scores) == (39.0, 10.0, 49.0)'
+          uv run --project automation flatfinder reassess --help
+          uv run --project automation python -c 'import sqlite3; from flatfinder.storage import migrate; c=sqlite3.connect(":memory:"); migrate(c); assert c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"; assert c.execute("PRAGMA user_version").fetchone()[0] == 17'
+          uv run --project automation python -c 'from flatfinder.config import load_config; from flatfinder.scoring import score_maxima; c=load_config("automation/config.example.toml"); assert score_maxima(c.scoring_max_scores) == (39.0, 10.0, 49.0)'
           git diff --check
 
       - name: Scan complete history for secrets
+        if: matrix.python == '3.13'
         run: |
           brew install gitleaks
           gitleaks git --redact --no-banner --log-opts="--all" .

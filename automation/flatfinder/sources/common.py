@@ -47,13 +47,12 @@ class SourceAdapter:
     search_page_url: Callable[[str, int], str]
     search_page_loaded: Callable[[Any], Awaitable[bool]]
     prepare_detail: Callable[[Any, str], Awaitable[None]]
-    extract_offer_links: Callable[[Any], Awaitable[list[tuple[str, str]]]]
+    extract_search_page: Callable[[Any], Awaitable[SearchPageResult]]
     extract_listing: Callable[[Any, Sequence[float]], Awaitable[ListingFacts]]
     extract_full_text: Callable[[Any, str], Awaitable[FullTextRecord]]
     matches_photo_url: Callable[[str | None], bool]
     normalize_photo_url: Callable[[str | None], str | None]
     prepare_page: Callable[[Any], Awaitable[None]] | None = None
-    extract_search_page: Callable[[Any], Awaitable[SearchPageResult]] | None = None
 
 
 def compute_coverage(facts: ListingFacts) -> float:
@@ -138,7 +137,7 @@ def collect_photo_urls(facts: ListingFacts) -> list[str]:
         canonical = adapter.normalize_photo_url(item) if adapter is not None else None
         if canonical and canonical not in seen:
             seen.add(canonical)
-            found.append(item)
+            found.append(canonical)
 
     visit(value)
     return found

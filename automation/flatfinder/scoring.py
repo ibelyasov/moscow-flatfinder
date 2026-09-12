@@ -7,6 +7,7 @@ from math import isfinite
 from numbers import Real
 from typing import Any
 
+from .geo_scoring import fitness_score, park_score
 from .models import (
     VISION_SCHEMA_VERSION,
     Evidence,
@@ -71,17 +72,17 @@ CRITERION_INPUT_FIELDS = {
 }
 CRITERION_MODEL_VERSIONS = {
     "noise": 1,
-    "park": 2,
+    "park": 3,
     "equipment": 2,
     "repair": 4,
     "price": 2,
-    "commute": 1,
+    "commute": 2,
     "area": 4,
     "visual_layout": 4,
     "floor": 1,
     "light_view": 1,
     "building": 3,
-    "fitness": 1,
+    "fitness": 2,
 }
 _VISUAL_CRITERIA = frozenset({"repair", "visual_layout", "light_view"})
 _HASH_IGNORED_KEYS = frozenset(
@@ -408,6 +409,14 @@ def score_park(observation: Any = None) -> float:
     if status_value is not None:
         return status_value
     if isinstance(raw, Mapping):
+        if any(
+            name in raw
+            for name in ("walking_minutes", "walking_distance_m", "area_hectares")
+        ):
+            return park_score(
+                _number(raw.get("walking_minutes")),
+                _number(raw.get("area_hectares")),
+            )
         numeric = _number(raw.get("score"))
         if numeric is not None:
             return max(0.0, min(9.0, numeric))
@@ -733,6 +742,29 @@ def score_fitness(observation: Any = None) -> float:
     if status_value is not None:
         return status_value
     if isinstance(raw, Mapping):
+        if any(
+            name in raw
+            for name in (
+                "walking_minutes",
+                "walking_distance_m",
+                "rating",
+                "review_count",
+                "sauna",
+            )
+        ):
+            review_count = _number(raw.get("review_count"))
+            sauna = raw.get("sauna") is True or _normalise(raw.get("sauna")) in {
+                "yes",
+                "true",
+                "present",
+                "confirmed",
+            }
+            return fitness_score(
+                _number(raw.get("walking_minutes")),
+                _number(raw.get("rating")),
+                int(review_count) if review_count is not None else None,
+                sauna,
+            )
         numeric = _number(raw.get("score"))
         if numeric is not None:
             return max(0.0, min(6.0, numeric))
@@ -936,7 +968,6 @@ def score_listing(
         route_minutes = _nested(route, "minutes")
     if route_minutes is None:
         route_minutes = route
-    route_score = _number(_nested(route, "average_score"))
     floor = _field_value(facts, observations, "floor")
     total_floors = _field_value(facts, observations, "total_floors")
     light_view = _field_value(facts, observations, "light_view", "view")
@@ -957,9 +988,7 @@ def score_listing(
         "equipment": score_equipment(equipment),
         "repair": score_repair(_field_value(facts, observations, "repair")),
         "price": score_price(monthly_total, configured_parameters),
-        "commute": route_score
-        if route_score is not None
-        else score_commute(route_minutes, configured_parameters),
+        "commute": score_commute(route_minutes, configured_parameters),
         "area": score_area(area, configured_parameters),
         "visual_layout": score_visual_layout(layout),
         "floor": score_floor(floor, total_floors),

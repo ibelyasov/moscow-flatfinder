@@ -16,7 +16,6 @@ from urllib.parse import urlencode
 from zoneinfo import ZoneInfo
 
 from .browser import detect_blocker
-from .scoring import score_commute
 from .twogis import (
     CommuteResult,
     FitnessResult,
@@ -310,14 +309,7 @@ async def calculate_commute(
         return result
     result.home_to_work_minutes = outbound.minutes
     result.work_to_home_minutes = inbound.minutes
-    result.home_to_work_score = score_commute(outbound.minutes)
-    result.work_to_home_score = score_commute(inbound.minutes)
     result.average_minutes = (outbound.minutes + inbound.minutes) / 2
-    result.average_score = (result.home_to_work_score + result.work_to_home_score) / 2
-    result.gate_status = (
-        "failed" if max(outbound.minutes, inbound.minutes) >= 45 else "passed"
-    )
-    result.commute_score = result.average_score
     result.status = "success"
     return result
 

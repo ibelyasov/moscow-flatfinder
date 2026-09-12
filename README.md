@@ -128,6 +128,20 @@ Optional modules add:
   and view assessment. The model is configurable; the recommended profile is
   Codex with `gpt-5.6-luna` and `medium` effort.
 
+The application is a modular Python monolith. `config` validates settings without
+accessing credentials. `assessment` builds one decision from facts and a scoring
+policy; collection and reassessment use the same calculation. `application`
+owns user operations, while `pipeline` owns the durable browser queue and returns
+one outcome per processed listing. `vision_workflow` owns persisted photo analysis.
+SQLite writes live in `storage`, workflow queries in `queries`, and the batched
+`read_model` supplies both Streamlit and deterministic JSON serialization.
+
+Each new assessment records its scoring policy. Changing the config marks older
+assessments as stale; opening the review interface does not recalculate them.
+Run `flatfinder reassess` to recalculate all active listings from saved facts, or
+`flatfinder reassess 123` for one internal listing ID. This does not collect pages,
+request routes, or run Vision. Manual ratings and favorites are preserved.
+
 ## Privacy and limits
 
 Personal data stays outside Git in
@@ -165,12 +179,27 @@ root, run:
 uv sync --project automation --locked
 uv run --project automation python -m compileall -q automation/flatfinder
 PYTHONPATH=automation uv run --project automation python -c \
-  'from flatfinder import admin, cli, export, extract, photos, pipeline, scoring, storage, vision'
+  'from flatfinder import admin, application, assessment, cli, config, export, photos, pipeline, queries, read_model, scoring, storage, vision, vision_workflow; from flatfinder.sources import cian, yandex_realty'
 uv run --project automation flatfinder --help
 sqlite3 "$HOME/Library/Application Support/MoscowFlatFinder/data/listings.sqlite3" \
   'PRAGMA integrity_check;'
 git diff --check
 ```
+
+When the required `uv` version is unavailable but the locked environment already
+exists, the same Python checks can run with `automation/.venv/bin/python` and
+`PYTHONPATH=automation`; CLI smoke uses `python -m flatfinder.cli --help`. This
+checks the code in that environment and does not validate a fresh dependency sync.
+Use temporary synthetic SQLite databases for refactor checks, including policy
+changes, reassessment, preserved manual decisions, and transaction rollback.
+
+The supported entrypoint is the `flatfinder` CLI. Internal Python imports changed
+in the architecture refactor: use `flatfinder.sources.cian` and
+`flatfinder.sources.yandex_realty` instead of the removed root `cian`/`extract`
+facades. Shared parsing guards live in `flatfinder.sources.common`; discovery
+uses `adapter.extract_search_page(page)` and its `.links` result instead of
+`extract_offer_links`. Configuration is in `flatfinder.config`, and persisted
+Vision operations are in `flatfinder.vision_workflow`.
 
 </details>
 

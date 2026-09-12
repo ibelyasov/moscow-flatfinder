@@ -9,7 +9,7 @@ import json
 import math
 import re
 import sqlite3
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
@@ -28,6 +28,8 @@ from crawlee.router import Router
 from crawlee.storage_clients import FileSystemStorageClient
 from crawlee.storages import RequestQueue
 
+from . import queries
+from .assessment import evaluate_listing
 from .browser import (
     classify_blocker,
     detect_blocker,
@@ -35,27 +37,17 @@ from .browser import (
     start_browser_background_watcher,
     stop_browser_background_watcher,
 )
+from .config import Config, photo_cache_dir
 from .enrich import (
     apply_enrichment,
     enrich_environment,
     normalize_facts,
     persist_enrichment,
-    recompute_assessment,
     select_top_candidates,
 )
-from .models import FullTextRecord, PhotoInput, ResultStatus, ReviewStatus
+from .models import PhotoInput
 from .noise import apply_noise, calculate_noise
 from .photos import ingest_photos
-from .scoring import (
-    criterion_input_hashes,
-    evaluate_hard_constraints,
-    reuse_unchanged_criteria,
-    score_bucket,
-    score_listing,
-    score_maxima,
-    score_total,
-    visual_input_hash,
-)
 from .sources import (
     adapter_for_listing_url,
     adapter_for_search_url,
@@ -64,31 +56,25 @@ from .sources import (
 from .sources.common import (
     ListingOutsideSearch,
     ParserDriftError,
-    SearchPageResult,
     SourceAdapter,
     collect_photo_urls,
     guard_parser_drift,
 )
 from .storage import (
     create_run,
-    create_vision_run,
     detect_listing_duplicate,
     finish_run,
-    finish_vision_run,
-    insert_vision_proposals,
     latest_commute_check,
     latest_fitness_check,
     latest_fitness_check_at_point,
     latest_office_point,
     latest_park_check,
     latest_park_check_at_point,
-    mark_vision_content,
     persist_listing,
     reconcile_listing_states,
     record_commute_check,
     record_fitness_check,
     record_park_check,
-    review_proposal,
     upsert_full_text,
     upsert_photo_ingestion,
     vision_manual_review_count,
@@ -103,6 +89,7 @@ from .twogis import (
     geocode_address,
     saved_point,
 )
+from .vision_workflow import run_listing_vision
 from .yandex_routes import (
     YandexMapsRouteError,
     YandexMapsRouter,
@@ -118,12 +105,6 @@ class HTTPStatusError(RuntimeError):
     def __init__(self, status: int, url: str):
         self.status = int(status)
         super().__init__(f"HTTP {self.status} for {url}")
-
-
-def _config(config: Any, name: str, default: Any = None) -> Any:
-    if isinstance(config, Mapping):
-        return config.get(name, default)
-    return getattr(config, name, default)
 
 
 def _should_run_vision(
@@ -220,8 +201,8 @@ def _request_for_offer(
     return Request.from_url(source_url, **request_args)
 
 
-def _crawlee_storage_dir(config: Any) -> Path:
-    database = _config(config, "database")
+def _crawlee_storage_dir(config: Config) -> Path:
+    database = config.database
     if database and str(database) != ":memory:":
         database_path = Path(str(database)).expanduser().resolve()
     else:
@@ -232,7 +213,7 @@ def _crawlee_storage_dir(config: Any) -> Path:
     return database_path.parent / ".flatfinder-crawlee" / namespace
 
 
-def _crawlee_configuration(config: Any) -> CrawleeConfiguration:
+def _crawlee_configuration(config: Config) -> CrawleeConfiguration:
     desired = CrawleeConfiguration(
         storage_dir=str(_crawlee_storage_dir(config)),
         purge_on_start=False,
@@ -252,7 +233,7 @@ def _crawlee_configuration(config: Any) -> CrawleeConfiguration:
 
 
 def _build_crawler(
-    config: Any,
+    config: Config,
     request_manager: RequestQueue,
     request_handler: Any,
     storage_client: FileSystemStorageClient,
@@ -262,11 +243,11 @@ def _build_crawler(
     """Construct the native persistent Crawlee runtime."""
 
     profile_dir = prepare_profile_dir(config)
-    retries = max(0, int(_config(config, "network_retries", 2)))
+    retries = max(0, int(config.network_retries))
     browser_pool = BrowserPool.with_default_plugin(
         browser_type="chromium",
         user_data_dir=profile_dir,
-        headless=not bool(_config(config, "headed", False)),
+        headless=not bool(config.headed),
         fingerprint_generator=None,
         use_incognito_pages=False,
         browser_inactive_threshold=timedelta(hours=24),
@@ -357,6 +338,19 @@ class QueueResult:
     visual_coverage: float = 0.0
     manual_review_count: int = 0
 
+    def record_listing(self, outcome: ListingOutcome, retries: int) -> None:
+        self.written_assessments += 1
+        self.field_coverages.append(outcome.coverage)
+        self.cards_changed += outcome.cards_changed
+        self.photos_processed += outcome.photos_processed
+        self.enriched_count += outcome.enriched_count
+        self.enrichment_errors.extend(outcome.enrichment_errors)
+        self.vision_attempts += outcome.vision_attempts
+        self.vision_failed += outcome.vision_failed
+        if outcome.visual_coverage is not None:
+            self.visual_coverage = outcome.visual_coverage
+        self.retries += retries
+
 
 @dataclass(slots=True)
 class RunResult:
@@ -386,10 +380,7 @@ class RunResult:
 
 def _recent_coverages(conn: Any, parser_version: str) -> list[float]:
     try:
-        rows = conn.execute(
-            "SELECT field_coverage FROM runs WHERE parser_version = ? AND field_coverage IS NOT NULL ORDER BY id DESC LIMIT 5",
-            (str(parser_version),),
-        ).fetchall()
+        rows = queries.recent_coverage_rows(conn, parser_version)
     except sqlite3.Error:
         return []
     values: list[float] = []
@@ -405,7 +396,7 @@ def _recent_coverages(conn: Any, parser_version: str) -> list[float]:
 
 
 async def discover(
-    config: Any,
+    config: Config,
     conn: Any,
     page: Any,
     *,
@@ -416,10 +407,10 @@ async def discover(
     reason = await _await(detect_blocker(page))
     if reason:
         raise BlockedRun(reason)
-    search_url = search_url or _config(config, "search_url")
+    search_url = search_url or config.search_url
     if not isinstance(search_url, str) or not search_url.strip():
         raise ValueError("search_url is required")
-    max_cards = max(0, int(_config(config, "max_cards_per_run", 100)))
+    max_cards = max(0, int(config.max_cards_per_run))
     if max_cards == 0:
         return DiscoveryResult()
     links: list[tuple[str, str]] = []
@@ -436,11 +427,7 @@ async def discover(
         reason = await _await(detect_blocker(page))
         if reason:
             raise BlockedRun(reason)
-        search_page = (
-            await adapter.extract_search_page(page)
-            if adapter.extract_search_page is not None
-            else SearchPageResult(await adapter.extract_offer_links(page))
-        )
+        search_page = await adapter.extract_search_page(page)
         raw_links = search_page.links
         added = 0
         for item in raw_links:
@@ -467,79 +454,10 @@ async def discover(
 
     cards_new = 0
     for source_id, url in links:
-        existing_listing = conn.execute(
-            "SELECT id FROM listings WHERE source = ? AND source_listing_id = ? LIMIT 1",
-            (source, source_id),
-        ).fetchone()
+        existing_listing = queries.listing_id_by_source(conn, source, source_id)
         if existing_listing is None:
             cards_new += 1
     return DiscoveryResult(len(links), cards_new, 0, links, complete)
-
-
-def _status(value: Any) -> str:
-    return str(getattr(value, "value", value))
-
-
-def _assessment(facts: Any, scores: Mapping[str, float]) -> dict[str, Any]:
-    fields = getattr(facts, "fields", {})
-    field_map = {
-        "noise": ("noise",),
-        "park": ("park",),
-        "equipment": ("appliances", "equipment"),
-        "repair": ("repair",),
-        "price": ("price_monthly", "price", "commission", "utilities"),
-        "commute": ("route", "route_minutes"),
-        "area": ("area_m2",),
-        "visual_layout": ("layout",),
-        "floor": ("floor", "total_floors"),
-        "light_view": ("light_view",),
-        "building": ("building_year",),
-        "personal": (),
-        "fitness": ("fitness",),
-    }
-    result: dict[str, Any] = {}
-    for criterion, score in scores.items():
-        evidence: list[str] = []
-        states: list[str] = []
-        for name in field_map.get(criterion, ()):
-            value = fields.get(name) if isinstance(fields, Mapping) else None
-            if value is None:
-                continue
-            states.append(_status(getattr(value, "status", "unknown")))
-            for item in getattr(value, "evidence", ()) or ():
-                detail = getattr(item, "detail", item)
-                if str(detail) not in evidence:
-                    evidence.append(str(detail))
-        confidence = (
-            "confirmed"
-            if states and all(state == "confirmed" for state in states)
-            else "partial"
-            if evidence
-            else "unknown"
-        )
-        if criterion == "equipment" and isinstance(fields, Mapping):
-            equipment = fields.get("appliances")
-            equipment = getattr(equipment, "value", equipment)
-            required = ("furnished", "ac", "dishwasher", "fridge", "washer")
-            if isinstance(equipment, Mapping):
-                complete = all(
-                    isinstance(
-                        equipment.get("bed")
-                        if name == "furnished" and equipment.get(name) is None
-                        else equipment.get(name),
-                        bool,
-                    )
-                    for name in required
-                )
-                confidence = (
-                    "confirmed" if complete else "partial" if evidence else "unknown"
-                )
-        result[criterion] = {
-            "score": float(score),
-            "evidence": evidence or ["No confirmed source evidence."],
-            "confidence": confidence,
-        }
-    return result
 
 
 def _is_http_4xx(error: BaseException) -> bool:
@@ -612,57 +530,18 @@ def normalize_blocker(reason: Any) -> str | None:
     )
 
 
-def _photo_cache_dir(config: Any) -> Path:
-    project_root = Path(__file__).resolve().parents[2]
-    configured = _config(config, "photo_cache_dir")
-    if configured:
-        path = Path(str(configured)).expanduser()
-        return (path if path.is_absolute() else project_root / path).resolve()
-    return (project_root / "data" / "photos").resolve()
-
-
 def _listing_source(url: str) -> str:
     return adapter_for_search_url(url).source
 
 
-def _parser_version(config: Any) -> str:
-    return adapter_for_search_url(str(_config(config, "search_url", ""))).parser_version
-
-
-def _processable_links(
-    conn: Any,
-    source: str,
-    links: Sequence[tuple[str, str]],
-) -> list[tuple[str, str]]:
-    """Keep hidden or inactive listings out of detail work."""
-
-    skipped = {
-        str(row[0])
-        for row in conn.execute(
-            """
-            SELECT l.source_listing_id
-            FROM listings AS l
-            LEFT JOIN assessments AS a ON a.listing_id = l.id
-            WHERE l.source = ? AND (a.disliked_at IS NOT NULL OR l.state != 'active')
-            """,
-            (source,),
-        ).fetchall()
-    }
-    return [(source_id, url) for source_id, url in links if source_id not in skipped]
+def _parser_version(config: Config) -> str:
+    return adapter_for_search_url(str(config.search_url)).parser_version
 
 
 def _previous_listing(conn: Any, facts: Any) -> tuple[Any, float, dict[str, Any]]:
     source_id = str(getattr(facts, "source_listing_id", ""))
     source = adapter_for_source(str(getattr(facts, "source", ""))).source
-    row = conn.execute(
-        """
-        SELECT l.id, l.content_sha256, a.personal_score, a.assessment_json
-        FROM listings AS l
-        LEFT JOIN assessments AS a ON a.listing_id = l.id
-        WHERE l.source = ? AND l.source_listing_id = ?
-        """,
-        (source, source_id),
-    ).fetchone()
+    row = queries.previous_listing_assessment(conn, source, source_id)
     if row is None:
         return None, 0.0, {}
     try:
@@ -678,330 +557,6 @@ def _previous_listing(conn: Any, facts: Any) -> tuple[Any, float, dict[str, Any]
 
 def _coverage_p50(values: list[float]) -> float | None:
     return float(median(values)) if values else None
-
-
-def vision_content_hash(
-    facts: Mapping[str, Any],
-    full_text: FullTextRecord | Mapping[str, Any],
-    photos: Sequence[PhotoInput],
-) -> str:
-    """Hash only photo identities; fact changes do not invalidate Vision."""
-
-    del facts, full_text
-    return visual_input_hash(photos)
-
-
-def _photo_rows(conn: Any, listing_id: int) -> list[PhotoInput]:
-    rows = conn.execute(
-        """
-        SELECT id, image_index, source_url, local_path, sha256, dhash,
-               duplicate_of, status, error, raw_source_url
-        FROM photo_ingestion
-        WHERE listing_id = ?
-        ORDER BY image_index
-        """,
-        (int(listing_id),),
-    ).fetchall()
-    return [
-        PhotoInput(
-            listing_id=int(listing_id),
-            image_index=int(row["image_index"] if hasattr(row, "keys") else row[1]),
-            source_url=str(row["source_url"] if hasattr(row, "keys") else row[2]),
-            local_path=(row["local_path"] if hasattr(row, "keys") else row[3]),
-            sha256=(row["sha256"] if hasattr(row, "keys") else row[4]),
-            dhash=(row["dhash"] if hasattr(row, "keys") else row[5]),
-            duplicate_of=(
-                int(row["duplicate_of"])
-                if hasattr(row, "keys") and row["duplicate_of"] is not None
-                else int(row[6])
-                if not hasattr(row, "keys") and row[6] is not None
-                else None
-            ),
-            status=str(row["status"] if hasattr(row, "keys") else row[7]),
-            error=(row["error"] if hasattr(row, "keys") else row[8]),
-            raw_source_url=(row["raw_source_url"] if hasattr(row, "keys") else row[9]),
-        )
-        for row in rows
-    ]
-
-
-def run_listing_vision(
-    conn: Any,
-    runtime: Any,
-    listing_id: int,
-    *,
-    force: bool = False,
-    auto_validate: bool = False,
-    vision_scoring_enabled: bool = False,
-    max_scores: Mapping[str, float] | None = None,
-    parameters: Mapping[str, float] | None = None,
-    thresholds: Mapping[str, float] | None = None,
-    hard_constraints: Mapping[str, Any] | None = None,
-) -> Any:
-    """Evaluate one listing and optionally apply its validated visual assessment."""
-
-    from .vision import DEFAULT_PROMPT_VERSION, MODEL_NAME, VisionRunResult, run_passes
-
-    listing_id = int(listing_id)
-    listing = conn.execute(
-        "SELECT vision_content_hash, state FROM listings WHERE id = ?", (listing_id,)
-    ).fetchone()
-    if listing is None:
-        raise ValueError(f"listing {listing_id} does not exist")
-    state = listing["state"] if hasattr(listing, "keys") else listing[1]
-    if state != "active":
-        return VisionRunResult(status="skipped", error="listing is not published")
-    snapshot = conn.execute(
-        """
-        SELECT facts_json FROM listing_snapshots
-        WHERE listing_id = ? ORDER BY id DESC LIMIT 1
-        """,
-        (listing_id,),
-    ).fetchone()
-    if snapshot is None:
-        raise ValueError(f"listing {listing_id} has no facts snapshot")
-    try:
-        facts = json.loads(
-            snapshot["facts_json"] if hasattr(snapshot, "keys") else snapshot[0]
-        )
-    except (TypeError, ValueError, json.JSONDecodeError) as error:
-        raise ValueError(f"listing {listing_id} has invalid facts snapshot") from error
-    if not isinstance(facts, Mapping):
-        # Stored-payload validation intentionally uses the project's ValueError API.
-        raise ValueError(  # noqa: TRY004
-            f"listing {listing_id} facts snapshot is not an object"
-        )
-    text_row = conn.execute(
-        "SELECT text, quotes_json, content_sha256, captured_at FROM full_text WHERE listing_id = ?",
-        (listing_id,),
-    ).fetchone()
-    if text_row is None:
-        full_text = FullTextRecord(
-            listing_id=listing_id,
-            text="",
-            quotes=[],
-            captured_at="",
-            content_sha256=hashlib.sha256(b"").hexdigest(),
-        )
-    else:
-        try:
-            quotes = json.loads(
-                text_row["quotes_json"] if hasattr(text_row, "keys") else text_row[1]
-            )
-        except (TypeError, ValueError, json.JSONDecodeError):
-            quotes = []
-        full_text = FullTextRecord(
-            listing_id=listing_id,
-            text=str(text_row["text"] if hasattr(text_row, "keys") else text_row[0]),
-            quotes=quotes if isinstance(quotes, list) else [],
-            captured_at=str(
-                text_row["captured_at"] if hasattr(text_row, "keys") else text_row[3]
-            ),
-            content_sha256=str(
-                text_row["content_sha256"] if hasattr(text_row, "keys") else text_row[2]
-            ),
-        )
-    photos = _photo_rows(conn, listing_id)
-    content_hash = vision_content_hash(facts, full_text, photos)
-    model_name = str(getattr(runtime, "model_name", MODEL_NAME) or MODEL_NAME)
-    model_version = str(getattr(runtime, "model_version", MODEL_NAME) or MODEL_NAME)
-    provider = str(getattr(runtime, "provider", "codex") or "codex")
-    reasoning_effort = str(getattr(runtime, "reasoning_effort", "medium") or "medium")
-    prompt_version = str(
-        getattr(runtime, "prompt_version", DEFAULT_PROMPT_VERSION)
-        or DEFAULT_PROMPT_VERSION
-    )
-    latest = conn.execute(
-        """
-        SELECT content_hash, status, schema_valid, provider, model_name, model_version,
-               reasoning_effort, prompt_version, visual_coverage
-        FROM vision_runs
-        WHERE listing_id = ?
-        ORDER BY id DESC LIMIT 1
-        """,
-        (listing_id,),
-    ).fetchone()
-    prior_hash = (
-        listing["vision_content_hash"] if hasattr(listing, "keys") else listing[0]
-    )
-    latest_values = (
-        (
-            latest["content_hash"],
-            latest["status"],
-            latest["schema_valid"],
-            latest["provider"],
-            latest["model_name"],
-            latest["model_version"],
-            latest["reasoning_effort"],
-            latest["prompt_version"],
-            latest["visual_coverage"],
-        )
-        if latest is not None and hasattr(latest, "keys")
-        else tuple(latest)
-        if latest is not None
-        else ()
-    )
-    if (
-        not force
-        and prior_hash == content_hash
-        and latest_values[:8]
-        == (
-            content_hash,
-            "success",
-            1,
-            provider,
-            model_name,
-            model_version,
-            reasoning_effort,
-            prompt_version,
-        )
-    ):
-        coverage = float(latest_values[8]) / 100.0
-        if vision_scoring_enabled:
-            recompute_assessment(
-                conn,
-                listing_id,
-                vision_scoring_enabled=True,
-                max_scores=max_scores,
-                parameters=parameters,
-                thresholds=thresholds,
-                hard_constraints=hard_constraints,
-                vision_contract=(
-                    provider,
-                    model_name,
-                    reasoning_effort,
-                    prompt_version,
-                ),
-            )
-        return VisionRunResult(
-            status="skipped", visual_coverage=max(0.0, min(1.0, coverage))
-        )
-
-    # Move the current content hash before inference so proposals from an old
-    # snapshot stop being scoreable/manual immediately, even when this run fails.
-    contract_changed = bool(
-        latest_values
-        and latest_values[3:8]
-        != (provider, model_name, model_version, reasoning_effort, prompt_version)
-    )
-    if prior_hash != content_hash or contract_changed:
-        mark_vision_content(conn, listing_id, content_hash, 0.0)
-    run_id = create_vision_run(
-        conn,
-        listing_id,
-        model_name,
-        model_version,
-        prompt_version,
-        provider=provider,
-        reasoning_effort=reasoning_effort,
-        content_hash=content_hash,
-    )
-    if runtime is None:
-        error = "Luna photo-scoring runtime is unavailable; manual review required"
-        finish_vision_run(conn, run_id, "failed", schema_valid=False, error=error)
-        return VisionRunResult(
-            status="failed", schema_valid=False, error=error, visual_coverage=0.0
-        )
-    try:
-        result = run_passes(
-            runtime,
-            listing_id,
-            photos,
-            full_text,
-            facts,
-            model_version=model_version,
-            prompt_version=prompt_version,
-        )
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
-        message = str(error)[:1000] or error.__class__.__name__
-        finish_vision_run(conn, run_id, "failed", schema_valid=False, error=message)
-        return VisionRunResult(
-            status="failed", schema_valid=False, error=message, visual_coverage=0.0
-        )
-    proposals = [
-        replace(proposal, vision_run_id=run_id) for proposal in result.proposals
-    ]
-    coverage = max(0.0, min(1.0, float(result.visual_coverage)))
-    status = "success" if result.status == "success" else "failed"
-    apply_scores = bool(
-        auto_validate
-        and vision_scoring_enabled
-        and status == "success"
-        and result.schema_valid
-    )
-    try:
-        proposal_ids: list[int] = []
-        if proposals:
-            proposal_ids = insert_vision_proposals(conn, proposals)
-        finish_vision_run(
-            conn,
-            run_id,
-            status,
-            schema_valid=bool(result.schema_valid),
-            retry_count=int(result.retry_count),
-            visual_coverage=coverage * 100.0,
-            error=result.error,
-        )
-        if status == "success":
-            if apply_scores:
-                for proposal, proposal_id in zip(proposals, proposal_ids, strict=True):
-                    if proposal.result_status == ResultStatus.CATEGORY:
-                        review_proposal(
-                            conn,
-                            proposal_id,
-                            ReviewStatus.VALIDATED,
-                            vision_contract=(
-                                provider,
-                                model_name,
-                                reasoning_effort,
-                                prompt_version,
-                            ),
-                        )
-                result.proposals = [
-                    replace(proposal, review_status=ReviewStatus.VALIDATED)
-                    if proposal.result_status == ResultStatus.CATEGORY
-                    else proposal
-                    for proposal in proposals
-                ]
-            mark_vision_content(conn, listing_id, content_hash, coverage * 100.0)
-            if apply_scores:
-                recompute_assessment(
-                    conn,
-                    listing_id,
-                    vision_scoring_enabled=True,
-                    max_scores=max_scores,
-                    parameters=parameters,
-                    thresholds=thresholds,
-                    hard_constraints=hard_constraints,
-                    vision_contract=(
-                        provider,
-                        model_name,
-                        reasoning_effort,
-                        prompt_version,
-                    ),
-                )
-    except (sqlite3.Error, OverflowError, RuntimeError, TypeError, ValueError) as error:
-        message = str(error)[:1000] or error.__class__.__name__
-        try:
-            finish_vision_run(conn, run_id, "failed", schema_valid=False, error=message)
-        except (
-            sqlite3.Error,
-            OverflowError,
-            RuntimeError,
-            TypeError,
-            ValueError,
-        ) as persistence_error:
-            message = (
-                f"{message}; failure status persistence failed ({persistence_error})"
-            )
-        return VisionRunResult(
-            status="failed",
-            proposals=[],
-            schema_valid=False,
-            error=message,
-            visual_coverage=coverage,
-        )
-    return result
 
 
 def _summary_payload(
@@ -1043,22 +598,7 @@ def _summary_payload(
 
 def _enrichment_candidates(conn: Any) -> tuple[list[dict[str, Any]], list[str]]:
     """Read base assessments and their latest normalized facts for top-N checks."""
-    rows = conn.execute(
-        """
-        SELECT l.id AS listing_id, l.source_listing_id, l.source_url, l.first_seen_at,
-               a.auto_score, a.completeness, a.status,
-               (SELECT s.facts_json FROM listing_snapshots AS s
-                WHERE s.listing_id = l.id
-                  AND s.content_sha256 = l.content_sha256
-                ORDER BY s.id DESC LIMIT 1) AS facts_json,
-               l.source AS source
-        FROM assessments AS a JOIN listings AS l ON l.id = a.listing_id
-        LEFT JOIN listing_duplicates AS d ON d.listing_id = l.id
-        LEFT JOIN listings AS canonical ON canonical.id = d.canonical_listing_id
-        WHERE l.state = 'active' AND a.disliked_at IS NULL
-          AND (d.listing_id IS NULL OR canonical.state != 'active')
-        """
-    ).fetchall()
+    rows = queries.enrichment_candidate_rows(conn)
     candidates: list[dict[str, Any]] = []
     errors: list[str] = []
     for row in rows:
@@ -1123,13 +663,13 @@ def _enrichment_candidates(conn: Any) -> tuple[list[dict[str, Any]], list[str]]:
 
 
 async def _enrich_top_candidates(
-    config: Any, conn: Any, page: Any
+    config: Config, conn: Any, page: Any
 ) -> tuple[int, int, list[str], int]:
     try:
-        limit = max(0, int(_config(config, "top_n", 10)))
+        limit = max(0, int(config.top_n))
     except (TypeError, ValueError):
         limit = 10
-    vision_scoring_enabled = bool(_config(config, "vision_scoring_enabled", False))
+    vision_scoring_enabled = bool(config.vision_scoring_enabled)
     candidates, errors = _enrichment_candidates(conn)
     selected = select_top_candidates(candidates, limit=limit)
     enriched = 0
@@ -1143,11 +683,11 @@ async def _enrich_top_candidates(
                 candidate["listing_id"],
                 facts,
                 vision_scoring_enabled=vision_scoring_enabled,
-                max_scores=_config(config, "scoring_max_scores"),
-                parameters=_config(config, "scoring_parameters"),
-                thresholds=_config(config, "scoring_thresholds"),
-                hard_constraints=_config(config, "hard_constraints"),
-                vision_contract=_config(config, "vision_contract"),
+                max_scores=config.scoring_max_scores,
+                parameters=config.scoring_parameters,
+                thresholds=config.scoring_thresholds,
+                hard_constraints=config.hard_constraints,
+                vision_contract=config.vision_contract,
             )
             enriched += 1
         # Network adapters and enrichment providers expose third-party errors;
@@ -1202,6 +742,7 @@ class _ScoredListing:
     auto_score: float
     total: float
     coverage: float
+    status: str
 
 
 async def _navigate_and_extract_listing(
@@ -1224,7 +765,7 @@ async def _navigate_and_extract_listing(
 
 
 def _filter_listing(
-    config: Any,
+    config: Config,
     conn: Any,
     search_url: str,
     source: str,
@@ -1257,7 +798,7 @@ def _filter_listing(
 
 
 async def _prepare_listing(
-    config: Any,
+    config: Config,
     conn: Any,
     adapter: SourceAdapter,
     search_url: str,
@@ -1273,7 +814,7 @@ async def _prepare_listing(
 
 
 async def _enrich_commute(
-    config: Any,
+    config: Config,
     conn: Any,
     page: Any,
     state: _ListingRouteState,
@@ -1305,18 +846,18 @@ async def _enrich_commute(
     state.router = state.router or await YandexMapsRouter.from_listing_page(
         page, config
     )
-    destination = str(_config(config, "destination", "") or "")
+    destination = str(config.destination or "")
     state.listing_point = await asyncio.to_thread(
         _resolve_listing_point,
         state.address,
-        str(_config(config, "twogis_api_key", "") or ""),
+        str(config.twogis_api_key or ""),
         state.source_point,
     )
     commute = await calculate_commute(
         state.router,
         state.address,
         destination,
-        str(_config(config, "twogis_api_key", "") or ""),
+        str(config.twogis_api_key or ""),
         home_point=state.listing_point,
         office_point=latest_office_point(conn, address_hash(destination)),
     )
@@ -1362,7 +903,7 @@ def _load_park_and_fitness_cache(conn: Any, state: _ListingRouteState) -> None:
 
 
 async def _enrich_park(
-    config: Any, conn: Any, page: Any, state: _ListingRouteState
+    config: Config, conn: Any, page: Any, state: _ListingRouteState
 ) -> None:
     """Reuse or calculate the nearest park for the resolved home point."""
 
@@ -1388,7 +929,7 @@ async def _enrich_park(
     park = await calculate_park(
         state.router,
         state.address,
-        str(_config(config, "twogis_api_key", "") or ""),
+        str(config.twogis_api_key or ""),
         home_point=state.listing_point,
     )
     apply_park(state.facts, park)
@@ -1396,7 +937,7 @@ async def _enrich_park(
 
 
 async def _enrich_fitness(
-    config: Any, conn: Any, page: Any, state: _ListingRouteState
+    config: Config, conn: Any, page: Any, state: _ListingRouteState
 ) -> None:
     """Reuse or calculate fitness amenities for the resolved home point."""
 
@@ -1422,7 +963,7 @@ async def _enrich_fitness(
     fitness = await calculate_fitness(
         state.router,
         state.address,
-        str(_config(config, "twogis_api_key", "") or ""),
+        str(config.twogis_api_key or ""),
         home_point=state.listing_point
         or saved_point(state.new_commute_payload or state.commute_payload, "home"),
     )
@@ -1430,12 +971,12 @@ async def _enrich_fitness(
     state.new_fitness_payload = fitness.to_payload()
 
 
-async def _apply_listing_noise(config: Any, state: _ListingRouteState) -> None:
+async def _apply_listing_noise(config: Config, state: _ListingRouteState) -> None:
     """Apply optional local noise data after the route browser is closed."""
 
-    if not bool(_config(config, "noise_enabled", False)):
+    if not bool(config.noise_enabled):
         return
-    noise_map = str(_config(config, "noise_map", "") or "").strip()
+    noise_map = str(config.noise_map or "").strip()
     if noise_map:
         noise = await asyncio.to_thread(
             calculate_noise,
@@ -1448,7 +989,7 @@ async def _apply_listing_noise(config: Any, state: _ListingRouteState) -> None:
 
 
 async def _enrich_listing_routes(
-    config: Any, conn: Any, page: Any, prepared: _PreparedListing
+    config: Config, conn: Any, page: Any, prepared: _PreparedListing
 ) -> _ListingEnrichment:
     """Reuse or calculate commute, park, fitness, and noise enrichment."""
 
@@ -1458,7 +999,7 @@ async def _enrich_listing_routes(
         address=prepared.address,
         source_point=prepared.source_point,
     )
-    if not bool(_config(config, "geo_enabled", False)):
+    if not bool(config.geo_enabled):
         state.listing_point = state.source_point
         await _apply_listing_noise(config, state)
         return _ListingEnrichment(None, None, None)
@@ -1481,57 +1022,39 @@ async def _enrich_listing_routes(
 
 
 def _score_listing(
-    config: Any, conn: Any, recent: list[float], prepared: _PreparedListing
+    config: Config, conn: Any, recent: list[float], prepared: _PreparedListing
 ) -> _ScoredListing:
-    """Calculate scores and parser coverage before the persistence gate."""
+    """Evaluate through the same domain operation used by every reassessment."""
 
-    facts = prepared.facts
-    previous = prepared.previous
-    personal_score = prepared.personal_score
-    previous_assessment = prepared.previous_assessment
-    max_scores = _config(config, "scoring_max_scores")
-    parameters = _config(config, "scoring_parameters")
-    scores = score_listing(facts, {}, max_scores=max_scores, parameters=parameters)
-    assessment = _assessment(facts, scores)
-    assessment["eligibility"] = evaluate_hard_constraints(
-        facts, _config(config, "hard_constraints"), parameters
-    )
-    input_hashes = criterion_input_hashes(
-        facts,
+    evaluation = evaluate_listing(
+        prepared.facts,
+        prepared.previous_assessment,
+        prepared.personal_score,
+        max_scores=config.scoring_max_scores,
+        parameters=config.scoring_parameters,
+        thresholds=config.scoring_thresholds,
+        hard_constraints=config.hard_constraints,
         visual_hash=visual_score_input_hash(
-            conn, int(previous[0]), _config(config, "vision_contract")
+            conn, int(prepared.previous[0]), config.vision_contract
         )
-        if previous is not None
+        if prepared.previous is not None
         else None,
-        max_scores=max_scores,
-        parameters=parameters,
+        vision_scoring_enabled=bool(config.vision_scoring_enabled),
+        vision_contract=config.vision_contract,
     )
-    scores, assessment = reuse_unchanged_criteria(
-        scores,
-        assessment,
-        previous_assessment,
-        input_hashes,
-        max_scores=max_scores,
+    coverage = guard_parser_drift(prepared.facts, recent)
+    return _ScoredListing(
+        evaluation.scores,
+        evaluation.assessment,
+        evaluation.auto_score,
+        evaluation.total,
+        float(coverage),
+        evaluation.status,
     )
-    if previous is not None:
-        previous_personal = previous_assessment.get("personal")
-        if isinstance(previous_personal, Mapping):
-            personal_detail = json.loads(
-                json.dumps(previous_personal, ensure_ascii=False)
-            )
-            personal_detail["score"] = personal_score
-            assessment["personal"] = personal_detail
-        elif personal_score:
-            assessment["personal"]["score"] = personal_score
-    auto_score = sum(value for name, value in scores.items() if name != "personal")
-    automatic_max, _personal_max, _total_max = score_maxima(max_scores)
-    total = score_total(list(scores.values()), automatic_max) + personal_score
-    coverage = guard_parser_drift(facts, recent)
-    return _ScoredListing(scores, assessment, auto_score, total, float(coverage))
 
 
 async def _persist_scored_listing(
-    config: Any,
+    config: Config,
     conn: Any,
     page: Any,
     prepared: _PreparedListing,
@@ -1551,15 +1074,26 @@ async def _persist_scored_listing(
         scored.assessment,
         prepared.parser_version,
         personal_score=prepared.personal_score,
-        status=score_bucket(scored.auto_score, _config(config, "scoring_thresholds")),
-        max_scores=_config(config, "scoring_max_scores"),
+        status=scored.status,
+        max_scores=config.scoring_max_scores,
     )
 
     return listing_id
 
 
+@dataclass(slots=True)
+class _ListingProgress:
+    cards_changed: int = 0
+    photos_processed: int = 0
+    enriched_count: int = 0
+    enrichment_errors: list[str] = field(default_factory=list)
+    vision_attempts: int = 0
+    vision_failed: int = 0
+    visual_coverage: float | None = None
+
+
 def _record_commute_history(
-    conn: Any, result: QueueResult, listing_id: int, payload: Mapping[str, Any]
+    conn: Any, result: _ListingProgress, listing_id: int, payload: Mapping[str, Any]
 ) -> None:
     """Record commute history and preserve its queue counters/error text."""
 
@@ -1579,7 +1113,7 @@ def _record_commute_history(
 
 
 def _record_park_history(
-    conn: Any, result: QueueResult, listing_id: int, payload: Mapping[str, Any]
+    conn: Any, result: _ListingProgress, listing_id: int, payload: Mapping[str, Any]
 ) -> None:
     """Record park history without making enrichment persistence fatal."""
 
@@ -1592,7 +1126,7 @@ def _record_park_history(
 
 
 def _record_fitness_history(
-    conn: Any, result: QueueResult, listing_id: int, payload: Mapping[str, Any]
+    conn: Any, result: _ListingProgress, listing_id: int, payload: Mapping[str, Any]
 ) -> None:
     """Record fitness history without making enrichment persistence fatal."""
 
@@ -1605,7 +1139,7 @@ def _record_fitness_history(
 
 
 def _record_enrichment_history(
-    conn: Any, result: QueueResult, listing_id: int, enrichment: _ListingEnrichment
+    conn: Any, result: _ListingProgress, listing_id: int, enrichment: _ListingEnrichment
 ) -> None:
     """Persist newly calculated route/environment checks in their old order."""
 
@@ -1622,11 +1156,11 @@ def _record_enrichment_history(
 
 
 async def _score_and_persist_listing(
-    config: Any,
+    config: Config,
     conn: Any,
     page: Any,
     recent: list[float],
-    result: QueueResult,
+    result: _ListingProgress,
     prepared: _PreparedListing,
     enrichment: _ListingEnrichment,
 ) -> tuple[int, float]:
@@ -1635,9 +1169,7 @@ async def _score_and_persist_listing(
     scored = _score_listing(config, conn, recent, prepared)
     listing_id = await _persist_scored_listing(config, conn, page, prepared, scored)
     _record_enrichment_history(conn, result, listing_id, enrichment)
-    current = conn.execute(
-        "SELECT content_sha256 FROM listings WHERE id = ?", (listing_id,)
-    ).fetchone()
+    current = queries.listing_content_hash(conn, listing_id)
     if (
         prepared.previous is not None
         and current is not None
@@ -1648,12 +1180,12 @@ async def _score_and_persist_listing(
 
 
 async def _persist_listing_artifacts(
-    config: Any,
+    config: Config,
     conn: Any,
     page: Any,
     prepared: _PreparedListing,
     listing_id: int,
-    result: QueueResult,
+    result: _ListingProgress,
 ) -> None:
     """Persist full text and photos after the listing snapshot is durable."""
 
@@ -1676,7 +1208,7 @@ async def _persist_listing_artifacts(
     photos: list[PhotoInput] = []
     try:
         photos = await ingest_photos(
-            page, listing_id, photo_urls, _photo_cache_dir(config)
+            page, listing_id, photo_urls, photo_cache_dir(config)
         )
     # Photo ingestion crosses Playwright, HTTP, Pillow, and filesystem APIs;
     # retain failed photo rows instead of losing the durable listing.
@@ -1706,9 +1238,9 @@ async def _persist_listing_artifacts(
 
 
 async def _run_listing_vision_if_needed(
-    config: Any,
+    config: Config,
     conn: Any,
-    result: QueueResult,
+    result: _ListingProgress,
     listing_id: int,
     previous: Any,
     vision_runtime: Any,
@@ -1717,10 +1249,7 @@ async def _run_listing_vision_if_needed(
 ) -> None:
     """Run optional Vision off the event loop and update queue counters."""
 
-    latest_vision = conn.execute(
-        "SELECT status FROM vision_runs WHERE listing_id = ? ORDER BY id DESC LIMIT 1",
-        (listing_id,),
-    ).fetchone()
+    latest_vision = queries.latest_vision_status(conn, listing_id)
     should_run_vision = _should_run_vision(
         vision_enabled,
         refresh_existing_vision,
@@ -1735,14 +1264,12 @@ async def _run_listing_vision_if_needed(
             conn,
             vision_runtime,
             listing_id,
-            auto_validate=bool(_config(config, "vision_auto_validate", False)),
-            vision_scoring_enabled=bool(
-                _config(config, "vision_scoring_enabled", False)
-            ),
-            max_scores=_config(config, "scoring_max_scores"),
-            parameters=_config(config, "scoring_parameters"),
-            thresholds=_config(config, "scoring_thresholds"),
-            hard_constraints=_config(config, "hard_constraints"),
+            auto_validate=bool(config.vision_auto_validate),
+            vision_scoring_enabled=bool(config.vision_scoring_enabled),
+            max_scores=config.scoring_max_scores,
+            parameters=config.scoring_parameters,
+            thresholds=config.scoring_thresholds,
+            hard_constraints=config.hard_constraints,
         )
         if vision_result.status != "skipped":
             result.vision_attempts += 1
@@ -1758,40 +1285,76 @@ async def _run_listing_vision_if_needed(
         )
 
 
-async def _process_listing(
-    config: Any,
-    conn: Any,
-    adapter: SourceAdapter,
-    search_url: str,
-    page: Any,
-    recent: list[float],
-    result: QueueResult,
-    vision_runtime: Any,
-    vision_enabled: bool,
-    refresh_existing_vision: bool,
-) -> float:
-    """Run one claimed listing; Crawlee owns retries around this operation."""
-    prepared = await _prepare_listing(config, conn, adapter, search_url, page, recent)
-    enrichment = await _enrich_listing_routes(config, conn, page, prepared)
-    listing_id, coverage = await _score_and_persist_listing(
-        config, conn, page, recent, result, prepared, enrichment
-    )
-    await _persist_listing_artifacts(config, conn, page, prepared, listing_id, result)
-    await _run_listing_vision_if_needed(
-        config,
-        conn,
-        result,
-        listing_id,
-        prepared.previous,
-        vision_runtime,
-        vision_enabled,
-        refresh_existing_vision,
-    )
-    return coverage
+@dataclass(frozen=True, slots=True)
+class ListingClaim:
+    adapter: SourceAdapter
+    search_url: str
+    recent_coverages: tuple[float, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ListingOutcome:
+    listing_id: int
+    coverage: float
+    cards_changed: int
+    photos_processed: int
+    enriched_count: int
+    enrichment_errors: tuple[str, ...]
+    vision_attempts: int
+    vision_failed: int
+    visual_coverage: float | None
+
+
+@dataclass(slots=True)
+class ListingProcessor:
+    """Process a claimed card; Crawlee owns queue lifecycle and retries."""
+
+    config: Config
+    conn: Any
+    vision_runtime: Any = None
+    vision_enabled: bool = False
+    refresh_existing_vision: bool = False
+
+    async def process(self, claim: ListingClaim, page: Any) -> ListingOutcome:
+        progress = _ListingProgress()
+        recent = list(claim.recent_coverages)
+        prepared = await _prepare_listing(
+            self.config, self.conn, claim.adapter, claim.search_url, page, recent
+        )
+        enrichment = await _enrich_listing_routes(
+            self.config, self.conn, page, prepared
+        )
+        listing_id, coverage = await _score_and_persist_listing(
+            self.config, self.conn, page, recent, progress, prepared, enrichment
+        )
+        await _persist_listing_artifacts(
+            self.config, self.conn, page, prepared, listing_id, progress
+        )
+        await _run_listing_vision_if_needed(
+            self.config,
+            self.conn,
+            progress,
+            listing_id,
+            prepared.previous,
+            self.vision_runtime,
+            self.vision_enabled,
+            self.refresh_existing_vision,
+        )
+        return ListingOutcome(
+            listing_id,
+            coverage,
+            progress.cards_changed,
+            progress.photos_processed,
+            progress.enriched_count,
+            tuple(progress.enrichment_errors),
+            progress.vision_attempts,
+            progress.vision_failed,
+            progress.visual_coverage,
+        )
 
 
 async def _run_crawlee(
-    config: Any,
+    config: Config,
     conn: Any,
     run_id: int,
     *,
@@ -1802,8 +1365,11 @@ async def _run_crawlee(
     """Run one discovery/details phase, then a separate native finalize phase."""
 
     result = QueueResult()
+    processor = ListingProcessor(
+        config, conn, vision_runtime, vision_enabled, refresh_existing_vision
+    )
     discovery_result = DiscoveryResult()
-    search_url = _config(config, "search_url")
+    search_url = config.search_url
     if not isinstance(search_url, str) or not search_url.strip():
         raise ValueError("search_url is required")
     adapter = adapter_for_search_url(search_url)
@@ -1861,12 +1427,12 @@ async def _run_crawlee(
                 _request_for_offer(
                     source_id,
                     url,
-                    int(_config(config, "network_retries", 2)),
+                    int(config.network_retries),
                     source=request_adapter.source,
                     search_url=request_search_url,
                     always_enqueue=True,
                 )
-                for source_id, url in _processable_links(
+                for source_id, url in queries.processable_listing_links(
                     conn,
                     request_adapter.source,
                     discovery_result.links,
@@ -1905,7 +1471,7 @@ async def _run_crawlee(
                     )
             else:
                 request_search_url = request_url
-            if source_id and not _processable_links(
+            if source_id and not queries.processable_listing_links(
                 conn,
                 request_adapter.source,
                 [(source_id, request_url)],
@@ -1916,30 +1482,19 @@ async def _run_crawlee(
                 request_adapter.source,
                 _recent_coverages(conn, request_adapter.parser_version),
             )
-            coverage = await _process_listing(
-                config,
-                conn,
-                request_adapter,
-                request_search_url,
+            outcome = await processor.process(
+                ListingClaim(request_adapter, request_search_url, tuple(recent)),
                 context.page,
-                recent,
-                result,
-                vision_runtime,
-                vision_enabled,
-                refresh_existing_vision,
             )
-            result.written_assessments += 1
-            result.field_coverages.append(coverage)
-            recent_by_source[request_adapter.source] = (recent + [coverage])[-5:]
-            result.retries += int(context.request.retry_count)
+            result.record_listing(outcome, int(context.request.retry_count))
+            recent_by_source[request_adapter.source] = (recent + [outcome.coverage])[
+                -5:
+            ]
+
         except ListingOutsideSearch:
             context.request.no_retry = True
             if source_id:
-                conn.execute(
-                    "UPDATE listings SET state = 'inactive' WHERE source = ? AND source_listing_id = ?",
-                    (request_adapter.source, source_id),
-                )
-                conn.commit()
+                queries.mark_listing_inactive(conn, request_adapter.source, source_id)
         except BlockedRun as error:
             await stop_blocked(error.reason, context.request)
         except Exception as error:
@@ -2036,13 +1591,9 @@ async def _run_crawlee(
                             result.cards_failed += 1
                             result.status = "failed"
                             return
-                    cursor = conn.execute(
-                        "UPDATE listings SET state = 'inactive' "
-                        "WHERE source = ? AND source_listing_id = ? AND state != 'inactive'",
-                        (request_adapter.source, source_id),
+                    result.cards_changed += queries.mark_listing_inactive(
+                        conn, request_adapter.source, source_id
                     )
-                    conn.commit()
-                    result.cards_changed += max(0, int(cursor.rowcount))
                     return
             result.cards_failed += 1
             result.status = "failed"
@@ -2073,9 +1624,7 @@ async def _run_crawlee(
         crawler.pre_navigation_hook(prepare_source_page)
     crawler.error_handler(error_handler)
     crawler.failed_request_handler(failed_request_handler)
-    background_watcher = start_browser_background_watcher(
-        bool(_config(config, "headed", False))
-    )
+    background_watcher = start_browser_background_watcher(bool(config.headed))
     try:
         await request_manager.add_request(
             Request.from_url(
@@ -2083,7 +1632,7 @@ async def _run_crawlee(
                 label="discovery",
                 user_data={"run_id": run_id, "source": adapter.source},
                 always_enqueue=True,
-                max_retries=max(0, int(_config(config, "network_retries", 2))),
+                max_retries=max(0, int(config.network_retries)),
             )
         )
         await crawler.run(purge_request_queue=False)
@@ -2109,47 +1658,38 @@ async def _run_crawlee(
     finally:
         stop_browser_background_watcher(background_watcher)
     result.manual_review_count = vision_manual_review_count(
-        conn, vision_contract=_config(config, "vision_contract")
+        conn, vision_contract=config.vision_contract
     )
     return discovery_result, result
 
 
 async def run_once(
-    config: Any, conn: Any, *, refresh_existing_vision: bool = False
+    config: Config, conn: Any, *, refresh_existing_vision: bool = False
 ) -> RunResult:
     """Run native discovery/details and the follow-up finalize phase."""
 
     parser_version = _parser_version(config)
     run_id = create_run(conn, parser_version)
     vision_runtime = None
-    vision_enabled = bool(_config(config, "vision_enabled", False))
+    vision_enabled = bool(config.vision_enabled)
     cards_found = cards_new = cards_changed = 0
     queue = QueueResult()
     status = "success"
     blocked_reason: str | None = None
     try:
         if vision_enabled:
-            config_path = Path(
-                str(_config(config, "config_path", "automation/config.toml"))
-            ).resolve()
-            agent_config = _config(
-                config,
-                "vision_agent_config",
-                str(config_path.parent / "flatfinder-vision.toml"),
-            )
+            agent_config = config.vision_agent_config
             try:
                 from .vision import VisionRuntime
 
                 vision_runtime = VisionRuntime.load(
                     str(agent_config),
-                    provider=str(_config(config, "vision_provider", "codex")),
-                    model_name=str(_config(config, "vision_model", "gpt-5.6-luna")),
-                    reasoning_effort=str(
-                        _config(config, "vision_reasoning_effort", "medium")
-                    ),
-                    codex_bin=str(_config(config, "vision_codex_bin", "codex")),
-                    claude_bin=str(_config(config, "vision_claude_bin", "claude")),
-                    timeout_seconds=int(_config(config, "vision_timeout_seconds", 900)),
+                    provider=str(config.vision_provider),
+                    model_name=str(config.vision_model),
+                    reasoning_effort=str(config.vision_reasoning_effort),
+                    codex_bin=str(config.vision_codex_bin),
+                    claude_bin=str(config.vision_claude_bin),
+                    timeout_seconds=int(config.vision_timeout_seconds),
                 )
             except (OSError, RuntimeError, TypeError, ValueError):
                 vision_runtime = None
@@ -2206,7 +1746,7 @@ async def run_once(
                     vision_failed=queue.vision_failed,
                     visual_coverage=queue.visual_coverage,
                     manual_review_count=vision_manual_review_count(
-                        conn, vision_contract=_config(config, "vision_contract")
+                        conn, vision_contract=config.vision_contract
                     ),
                     parser_version=parser_version,
                 ),
@@ -2238,7 +1778,7 @@ async def run_once(
         vision_failed=queue.vision_failed,
         visual_coverage=queue.visual_coverage,
         manual_review_count=vision_manual_review_count(
-            conn, vision_contract=_config(config, "vision_contract")
+            conn, vision_contract=config.vision_contract
         ),
     )
 
@@ -2247,11 +1787,12 @@ __all__ = [
     "BlockedRun",
     "DiscoveryResult",
     "HTTPStatusError",
+    "ListingClaim",
+    "ListingOutcome",
+    "ListingProcessor",
     "QueueResult",
     "RunResult",
     "discover",
     "normalize_blocker",
-    "run_listing_vision",
     "run_once",
-    "vision_content_hash",
 ]

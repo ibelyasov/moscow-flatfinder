@@ -77,12 +77,12 @@ def normalize_photo_url(value: str | None) -> str | None:
         if _MDS_SIZE.fullmatch(piece):
             pieces[index] = "app_large"
     return urlunsplit(
-        (parsed.scheme.lower(), parsed.netloc.lower(), "/".join(pieces), "", "")
+        ("https", str(parsed.hostname).lower(), "/".join(pieces), "", "")
     )
 
 
 def is_allowed_photo_url(value: str | None) -> bool:
-    return matches_photo_url(value)
+    return matches_photo_url(value) and urlsplit(str(value)).scheme.lower() == "https"
 
 
 async def _await(value: Any) -> Any:
@@ -1246,10 +1246,6 @@ async def extract_search_page(page: Any) -> SearchPageResult:
     return SearchPageResult(result, total_pages)
 
 
-async def extract_offer_links(page: Any) -> list[tuple[str, str]]:
-    return (await extract_search_page(page)).links
-
-
 def _first_field_candidate(
     field: str, candidates: Mapping[str, list[tuple[Any, str]]]
 ) -> tuple[Any, str] | None:
@@ -1333,13 +1329,12 @@ ADAPTER = SourceAdapter(
     search_page_url=search_page_url,
     search_page_loaded=search_page_loaded,
     prepare_detail=prepare_detail,
-    extract_offer_links=extract_offer_links,
+    extract_search_page=extract_search_page,
     extract_listing=extract_listing,
     extract_full_text=extract_full_text,
     matches_photo_url=matches_photo_url,
     normalize_photo_url=normalize_photo_url,
     prepare_page=prepare_page,
-    extract_search_page=extract_search_page,
 )
 
 
@@ -1349,7 +1344,6 @@ __all__ = [
     "SOURCE",
     "extract_full_text",
     "extract_listing",
-    "extract_offer_links",
     "extract_search_page",
     "normalize_photo_url",
     "prepare_detail",

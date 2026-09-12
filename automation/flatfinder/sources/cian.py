@@ -49,11 +49,11 @@ def normalize_photo_url(value: str | None) -> str | None:
         parsed.path,
         flags=re.IGNORECASE,
     )
-    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, "", ""))
+    return urlunsplit(("https", str(parsed.hostname).lower(), path, "", ""))
 
 
 def is_allowed_photo_url(value: str | None) -> bool:
-    return matches_photo_url(value)
+    return matches_photo_url(value) and urlsplit(str(value)).scheme.lower() == "https"
 
 
 def canonical_offer_url(value: Any, base_url: str = "") -> str | None:
@@ -203,10 +203,6 @@ async def extract_search_page(page: Any) -> SearchPageResult:
             seen.add(identifier)
             result.append((identifier, url))
     return SearchPageResult(result)
-
-
-async def extract_offer_links(page: Any) -> list[tuple[str, str]]:
-    return (await extract_search_page(page)).links
 
 
 def _number(value: Any) -> float | int | None:
@@ -465,12 +461,11 @@ ADAPTER = SourceAdapter(
     search_page_url=search_page_url,
     search_page_loaded=search_page_loaded,
     prepare_detail=prepare_detail,
-    extract_offer_links=extract_offer_links,
+    extract_search_page=extract_search_page,
     extract_listing=extract_listing,
     extract_full_text=extract_full_text,
     matches_photo_url=matches_photo_url,
     normalize_photo_url=normalize_photo_url,
-    extract_search_page=extract_search_page,
 )
 
 
@@ -481,7 +476,6 @@ __all__ = [
     "canonical_offer_url",
     "extract_full_text",
     "extract_listing",
-    "extract_offer_links",
     "extract_search_page",
     "facts_from_payload",
     "normalize_photo_url",
