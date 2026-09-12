@@ -8,6 +8,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .config import find_vault_root
+
 try:
     from playwright.async_api import async_playwright
 except ImportError:  # pragma: no cover - dependency is installed in production
@@ -94,20 +96,6 @@ def _config(config: Any, name: str, default: Any = None) -> Any:
     if isinstance(config, dict):
         return config.get(name, default)
     return getattr(config, name, default)
-
-
-def find_vault_root(start: str | Path) -> Path | None:
-    """Find the nearest vault marker without assuming the current directory."""
-
-    path = Path(start).expanduser().resolve()
-    if path.is_file() or path.suffix in {".toml", ".json"}:
-        path = path.parent
-    for candidate in (path, *path.parents):
-        if (candidate / ".vault-config.json").is_file() or (
-            candidate / ".obsidian"
-        ).is_dir():
-            return candidate
-    return None
 
 
 def classify_blocker(url: str = "", text: str = "") -> str | None:

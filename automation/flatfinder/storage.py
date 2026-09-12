@@ -22,6 +22,8 @@ from .models import (
     validate_visual_payload,
 )
 from .scoring import score_maxima
+from .vision_contract import VisionContractLike
+from .vision_contract import vision_contract as _vision_contract
 
 MAX_SQLITE_ID = (1 << 63) - 1
 
@@ -53,25 +55,16 @@ END
 """
 
 
-def _current_vision_contract() -> tuple[str, str, str, str]:
-    """Return the backward-compatible default Vision contract."""
-
-    from .vision import DEFAULT_PROMPT_VERSION, MODEL_NAME
-
-    return "codex", MODEL_NAME, "medium", DEFAULT_PROMPT_VERSION
-
-
 def current_vision_run_id(
     conn: sqlite3.Connection,
     listing_id: int,
-    vision_contract: tuple[str, str, str, str] | None = None,
+    vision_contract: VisionContractLike | None = None,
 ) -> int | None:
     """Return the latest successful run matching the current content contract."""
 
     listing_id = int(listing_id)
-    provider, model_name, reasoning_effort, prompt_version = (
-        vision_contract or _current_vision_contract()
-    )
+    contract = _vision_contract(vision_contract)
+    provider, model_name, reasoning_effort, prompt_version = contract.as_tuple()
     row = conn.execute(
         """
         SELECT vr.id
@@ -105,7 +98,7 @@ def current_vision_run_id(
 def visual_score_input_hash(
     conn: sqlite3.Connection,
     listing_id: int,
-    vision_contract: tuple[str, str, str, str] | None = None,
+    vision_contract: VisionContractLike | None = None,
 ) -> str:
     row = conn.execute(
         "SELECT vision_content_hash FROM listings WHERE id = ?", (int(listing_id),)
@@ -1456,13 +1449,12 @@ def set_vision_content_hash(
 def vision_manual_review_count(
     conn: sqlite3.Connection,
     listing_id: int | None = None,
-    vision_contract: tuple[str, str, str, str] | None = None,
+    vision_contract: VisionContractLike | None = None,
 ) -> int:
     """Count pending proposals plus failed runs requiring a manual retry/review."""
 
-    provider, model_name, reasoning_effort, prompt_version = (
-        vision_contract or _current_vision_contract()
-    )
+    contract = _vision_contract(vision_contract)
+    provider, model_name, reasoning_effort, prompt_version = contract.as_tuple()
     listing_clause = " AND vr.listing_id = ?" if listing_id is not None else ""
     args = (provider, model_name, model_name, reasoning_effort, prompt_version)
     if listing_id is not None:
@@ -1716,7 +1708,7 @@ def review_proposal(
     review_status: ReviewStatus,
     *,
     reason: str | None = None,
-    vision_contract: tuple[str, str, str, str] | None = None,
+    vision_contract: VisionContractLike | None = None,
 ) -> sqlite3.Row:
     """Validate or reject one current visual assessment."""
 
@@ -1738,9 +1730,8 @@ def review_proposal(
             raise ValueError(f"vision proposal {proposal_id} does not exist")
         if row["review_status"] != ReviewStatus.PENDING.value:
             raise ValueError(f"vision proposal {proposal_id} has already been reviewed")
-        _provider, model_name, _reasoning_effort, prompt_version = (
-            vision_contract or _current_vision_contract()
-        )
+        contract = _vision_contract(vision_contract)
+        _provider, model_name, _reasoning_effort, prompt_version = contract.as_tuple()
         if (
             current_vision_run_id(conn, int(row["listing_id"]), vision_contract)
             != int(row["vision_run_id"])
@@ -2747,24 +2738,48 @@ def update_personal_score(
     *,
     max_scores: Mapping[str, float] | None = None,
 ) -> sqlite3.Row:
-    """Set a bounded manual score, mark the listing rated, and clear dislike."""
+    """Set a manual score using the policy that produced the saved assessment.
 
-    automatic_max, personal_max, _total_max = score_maxima(max_scores)
-    value = _bounded_float(score, "personal score", personal_max)
+    Legacy assessments have no recoverable policy. For them the caller's current
+    personal maximum is used, while the existing automatic score is only checked
+    for a finite non-negative value so a later policy reduction cannot block a
+    manual review.
+    """
+
     with _write_transaction(conn):
         row = _personal_assessment_row(conn, identifier)
         assessment_json = (
             row["assessment_json"] if isinstance(row, sqlite3.Row) else row[2]
         )
         listing_id = int(row["listing_id"] if isinstance(row, sqlite3.Row) else row[0])
-        auto_score = _bounded_float(
-            row["auto_score"] if isinstance(row, sqlite3.Row) else row[1],
-            "automatic score",
-            automatic_max,
-        )
         assessment = json.loads(assessment_json)
         if not isinstance(assessment, dict):
             assessment = {}
+        saved_policy = assessment.get("_policy")
+        saved_max_scores = (
+            saved_policy.get("max_scores")
+            if isinstance(saved_policy, Mapping) and saved_policy.get("fingerprint")
+            else None
+        )
+        effective_max_scores = (
+            saved_max_scores if isinstance(saved_max_scores, Mapping) else max_scores
+        )
+        automatic_max, personal_max, _total_max = score_maxima(effective_max_scores)
+        value = _bounded_float(score, "personal score", personal_max)
+        raw_auto_score = row["auto_score"] if isinstance(row, sqlite3.Row) else row[1]
+        if isinstance(saved_max_scores, Mapping):
+            auto_score = _bounded_float(
+                raw_auto_score, "automatic score", automatic_max
+            )
+        else:
+            try:
+                auto_score = float(raw_auto_score)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    "automatic score must be a finite number >= 0"
+                ) from exc
+            if not math.isfinite(auto_score) or auto_score < 0:
+                raise ValueError("automatic score must be a finite number >= 0")
         personal = assessment.get("personal")
         if isinstance(personal, dict):
             personal.update(

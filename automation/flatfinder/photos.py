@@ -6,6 +6,7 @@ import hashlib
 import inspect
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from .models import PhotoInput
 from .sources import adapter_for_photo_url
@@ -28,7 +29,10 @@ def _require_pillow() -> None:
 def is_allowed_photo_url(url: str | None) -> bool:
     """Return whether a URL belongs to an explicitly supported listing CDN."""
 
-    return adapter_for_photo_url(url) is not None
+    return (
+        adapter_for_photo_url(url) is not None
+        and urlsplit(str(url)).scheme.lower() == "https"
+    )
 
 
 def normalize_photo_url(url: str | None) -> str | None:
@@ -44,6 +48,9 @@ async def _await(value: object) -> object:
 
 async def _response_body(page: object, url: str) -> bytes:
     """Read an image through Playwright's request context, never raw HTTP."""
+
+    if not is_allowed_photo_url(url):
+        raise ValueError("photo URL must use HTTPS on a supported listing CDN")
 
     request = getattr(page, "request", None)
     if request is None:

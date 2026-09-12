@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import shutil
 import tempfile
 from collections.abc import Mapping
@@ -286,11 +287,8 @@ def apply_noise(
     facts: ListingFacts | dict[str, Any], result: NoiseResult | Mapping[str, Any]
 ) -> ListingFacts | dict[str, Any]:
     payload = result.to_payload() if isinstance(result, NoiseResult) else dict(result)
-    status = (
-        ValueStatus.CONFIRMED
-        if payload.get("status") == "success"
-        else ValueStatus.UNKNOWN
-    )
+    validation_error = _noise_validation_error(payload)
+    status = ValueStatus.CONFIRMED if validation_error is None else ValueStatus.UNKNOWN
     value = {
         "provider": "openstreetmap",
         "model_version": payload.get("model_version"),
@@ -302,6 +300,8 @@ def apply_noise(
         key: payload.get(key)
         for key in (
             "status",
+            "home_lat",
+            "home_lon",
             "noise_score",
             "nearest",
             "model_version",
@@ -309,6 +309,7 @@ def apply_noise(
             "error",
         )
     }
+    summary["validation_error"] = validation_error
     evidence = Evidence(
         "openstreetmap",
         json.dumps(summary, ensure_ascii=False, sort_keys=True),
@@ -333,6 +334,60 @@ def apply_noise(
         ],
     }
     return facts
+
+
+def _noise_number(
+    payload: Mapping[str, Any], key: str, lower: float, upper: float
+) -> float | None:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and lower <= number <= upper else None
+
+
+def _noise_validation_error(payload: Mapping[str, Any]) -> str | None:
+    if payload.get("status") != "success":
+        return "provider status is not success"
+    if payload.get("error"):
+        return "successful observation contains an error"
+    try:
+        captured_at = datetime.fromisoformat(str(payload.get("captured_at") or ""))
+    except ValueError:
+        return "capture timestamp is invalid"
+    if captured_at.tzinfo is None:
+        return "capture timestamp has no timezone"
+    if (
+        _noise_number(payload, "home_lat", -90, 90) is None
+        or _noise_number(payload, "home_lon", -180, 180) is None
+    ):
+        return "home coordinates are invalid"
+    if _noise_number(payload, "noise_score", 0, 6) is None:
+        return "noise score is invalid"
+    if payload.get("model_version") != MODEL_VERSION:
+        return "noise model version is invalid"
+    if re.fullmatch(r"[0-9a-f]{64}", str(payload.get("source_sha256") or "")) is None:
+        return "noise source hash is invalid"
+    nearest = payload.get("nearest")
+    if not isinstance(nearest, list):
+        return "nearest noise sources are missing"
+    for item in nearest:
+        if not isinstance(item, Mapping) or item.get("class") not in _SOURCE_CLASSES:
+            return "nearest noise source is invalid"
+        distance = _noise_number(item, "distance_m", 0, 10_000_000)
+        zero = _noise_number(item, "zero_distance_m", 0, 10_000_000)
+        radius = _noise_number(item, "no_penalty_distance_m", 0, 10_000_000)
+        penalty = _noise_number(item, "penalty", 0, 1)
+        if None in {distance, zero, radius, penalty} or zero > radius:
+            return "nearest noise source measurements are invalid"
+    expected_score = round(
+        6.0
+        * (1.0 - max((float(item["penalty"]) for item in nearest), default=0.0)),
+        1,
+    )
+    if not math.isclose(float(payload["noise_score"]), expected_score, abs_tol=0.05):
+        return "noise score is inconsistent with source measurements"
+    return None
 
 
 __all__ = [

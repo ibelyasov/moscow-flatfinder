@@ -25,30 +25,23 @@ if __package__ in {None, ""}:  # streamlit run automation/flatfinder/admin.py
     sys.path.insert(0, root)
 
 try:
-    from flatfinder.export import dashboard_payload, export_json
+    from flatfinder.application import record_review
+    from flatfinder.config import load_config, parse_listing_id, photo_cache_dir
     from flatfinder.models import VISION_SCHEMA_VERSION
     from flatfinder.photos import is_allowed_photo_url
-    from flatfinder.pipeline import _photo_cache_dir
+    from flatfinder.read_model import dashboard_payload
+    from flatfinder.scoring_policy import criterion_metadata, normalize_policy
     from flatfinder.sources import display_name as source_display_name
-    from flatfinder.storage import (
-        connect_db,
-        migrate,
-        set_listing_disliked,
-        set_listing_favorited,
-        update_personal_score,
-    )
+    from flatfinder.storage import connect_db, migrate
 except ModuleNotFoundError:  # pragma: no cover - package execution fallback
-    from .export import dashboard_payload, export_json
+    from .application import record_review
+    from .config import load_config, parse_listing_id, photo_cache_dir
+    from .models import VISION_SCHEMA_VERSION
     from .photos import is_allowed_photo_url
-    from .pipeline import _photo_cache_dir
+    from .read_model import dashboard_payload
+    from .scoring_policy import criterion_metadata, normalize_policy
     from .sources import display_name as source_display_name
-    from .storage import (
-        connect_db,
-        migrate,
-        set_listing_disliked,
-        set_listing_favorited,
-        update_personal_score,
-    )
+    from .storage import connect_db, migrate
 
 
 _DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "config.toml"
@@ -74,35 +67,6 @@ _MAP_COLOR_STOPS = (
     (147, 51, 234),
 )
 _MAP_STYLE = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"
-_CRITERION_LABELS = {
-    "noise": "Тишина",
-    "park": "Парк и прогулки",
-    "equipment": "Оснащение и мебель",
-    "repair": "Ремонт",
-    "price": "Полная стоимость",
-    "commute": "Дорога",
-    "area": "Площадь",
-    "visual_layout": "Планировка по фото",
-    "floor": "Этаж",
-    "light_view": "Свет и вид",
-    "building": "Год дома",
-    "fitness": "Зал с сауной",
-}
-_SCORE_HELP = {
-    "noise": "0–6 по ночной модели транспортного риска: достаточно одного близкого источника. Радиусы — 183 м для автодороги и 632 м для тяжёлой ЖД с OSM-поправками по классу; это screening, не расчёт дБ.",
-    "park": "Ближайший парк берётся из данных об окружении объявления. До 10 минут пешком сохраняется максимум; затем балл плавно снижается до 0 к 25 минутам.",
-    "equipment": "Кровать, кондиционер, посудомойка, холодильник и стиральная машина — по 3 за подтверждённое наличие, без бонуса за полный комплект.",
-    "repair": "Фотооценка ремонта по выбранной Vision-модели; неполные фото расширяют диапазон.",
-    "price": "Аренда + коммуналка + 1/12 комиссии. До 90 тыс. — 16; затем smoothstep плавно снижает оценку до 0 на 115 тыс.",
-    "commute": "До 25 мин — 9; 30 — 7; 35 — 5; 40 — 2; 45 и больше или неизвестно — 0. Между точками — интерполяция.",
-    "area": "Площадь оценивается отдельно от визуальной планировки.",
-    "visual_layout": "Vision оценивает удобство и свободную циркуляцию по фото.",
-    "floor": "Промежуточный этаж — 2; последний — 1; первый или неизвестный — 0.",
-    "light_view": "Vision оценивает свет и вид по фотографиям; без подходящих фото — 0.",
-    "building": "Только год постройки: 2020+ — 2; 2010-е — 1,5; 2000-е — 1; 1980–1999 — 0,5; раньше — 0; неизвестно — 1.",
-    "personal": "Ваша оценка от 0 до 10.",
-    "fitness": "Один поиск 2ГИС в радиусе 2 км. Качество по рейтингу и числу отзывов: обычный зал — до 2, хороший без сауны — до 4, хороший с явно указанной сауной — до 6. После 10 минут балл плавно снижается до 0 к 25 минутам.",
-}
 _GALLERY_CSS = """
 <style>
 .st-key-flatfinder-photo-strip[data-testid="stHorizontalBlock"] {
@@ -227,6 +191,18 @@ def _score(value: Any, default: str = "нет") -> str:
     return f"{result:g}" if result is not None else default
 
 
+def _criterion_score_text(
+    item: Mapping[str, Any],
+    criteria: Mapping[str, Any],
+    key: str,
+    maxima_known: bool,
+) -> str:
+    value = _score(_map(_map(item.get("assessment")).get(key)).get("score"), "0")
+    if not maxima_known:
+        return value
+    return f"{value}/{_score(_map(criteria.get(key)).get('max'), '0')}"
+
+
 def _minutes(value: Any) -> str:
     result = _num(value)
     return f"{result:.0f} мин" if result is not None else "—"
@@ -316,7 +292,7 @@ def _safe_local_image(value: Any, root: Path) -> str | None:
 def _safe_image_source(value: Any, config: Any) -> str | None:
     if is_allowed_photo_url(value):
         return str(value)
-    return _safe_local_image(value, _photo_cache_dir(config))
+    return _safe_local_image(value, photo_cache_dir(config))
 
 
 def _photo_sources(config: Any, item: Mapping[str, Any]) -> list[str]:
@@ -444,15 +420,31 @@ def _filtered(
         for item in _items(payload.get("listings"))
         if isinstance(item, Mapping) and included(item)
     ]
-    score = lambda item, name: _num(item.get(name), 0) or 0
-    rows.sort(
-        key=lambda item: (
-            -score(item, "total_score"),
-            -score(item, "auto_score"),
-            str(item.get("listing_id", "")),
+    if _scores_comparable(rows):
+        score = lambda item, name: _num(item.get(name), 0) or 0
+        rows.sort(
+            key=lambda item: (
+                -score(item, "total_score"),
+                -score(item, "auto_score"),
+                str(item.get("listing_id", "")),
+            )
         )
-    )
+    elif rows:
+        rows.sort(key=lambda item: int(_num(item.get("listing_id"), 0) or 0), reverse=True)
     return rows
+
+
+def _scores_comparable(listings: list[Mapping[str, Any]]) -> bool:
+    if not listings:
+        return True
+    if any(item.get("assessment_policy_known") is False for item in listings):
+        return False
+    fingerprints = {
+        str(item.get("assessment_policy_fingerprint"))
+        for item in listings
+        if item.get("assessment_policy_fingerprint")
+    }
+    return len(fingerprints) <= 1
 
 
 def _map_coordinates(item: Mapping[str, Any]) -> tuple[float, float] | None:
@@ -484,7 +476,9 @@ def _map_color(value: Any) -> list[int]:
     return [*color, 220]
 
 
-def _map_rows(listings: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def _map_rows(
+    listings: list[Mapping[str, Any]], *, scores_comparable: bool = True
+) -> list[dict[str, Any]]:
     rows = []
     for item in listings:
         point = _map_coordinates(item)
@@ -503,23 +497,26 @@ def _map_rows(listings: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
                 "score": round(score, 1),
             }
         )
-    if rows:
+    if rows and scores_comparable:
         low, high = min(row["score"] for row in rows), max(row["score"] for row in rows)
         for row in rows:
             row["color"] = _map_color(
                 50 if low == high else (row["score"] - low) / (high - low) * 100
             )
-        groups: dict[tuple[float, float], list[dict[str, Any]]] = {}
+    elif rows:
         for row in rows:
-            groups.setdefault((row["lat"], row["lon"]), []).append(row)
-        for group in groups.values():
-            for index, row in enumerate(group):
-                angle = 2 * math.pi * index / len(group)
-                radius = 18 if len(group) > 1 else 0
-                row["pixel_offset"] = [
-                    round(radius * math.cos(angle)),
-                    round(radius * math.sin(angle)),
-                ]
+            row["color"] = [107, 114, 128, 220]
+    groups: dict[tuple[float, float], list[dict[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault((row["lat"], row["lon"]), []).append(row)
+    for group in groups.values():
+        for index, row in enumerate(group):
+            angle = 2 * math.pi * index / len(group)
+            radius = 18 if len(group) > 1 else 0
+            row["pixel_offset"] = [
+                round(radius * math.cos(angle)),
+                round(radius * math.sin(angle)),
+            ]
     return rows
 
 
@@ -590,7 +587,13 @@ def _metro_display_rows(
     return markers, labels
 
 
-def _map_legend(rows: list[Mapping[str, Any]]) -> str:
+def _map_legend(rows: list[Mapping[str, Any]], *, scores_comparable: bool) -> str:
+    if not scores_comparable:
+        return (
+            '<div class="flatfinder-map-legend-slot"><div class="flatfinder-map-legend">'
+            "Оценки сохранены по разным или неизвестным правилам; цветовая шкала отключена."
+            "</div></div>"
+        )
     low, high = min(row["score"] for row in rows), max(row["score"] for row in rows)
     gradient = ", ".join(
         f"rgb({red}, {green}, {blue})" for red, green, blue in _MAP_COLOR_STOPS
@@ -642,7 +645,8 @@ def _selected_map_listing_id(event: Any) -> int | None:
 def _render_map(listings: list[Mapping[str, Any]]) -> None:
     import pydeck as pdk
 
-    rows = _map_rows(listings)
+    scores_comparable = _scores_comparable(listings)
+    rows = _map_rows(listings, scores_comparable=scores_comparable)
     if not rows:
         st.info("У выбранных квартир пока нет координат.")
         return
@@ -658,7 +662,7 @@ def _render_map(listings: list[Mapping[str, Any]]) -> None:
         view.zoom = min(14, (_num(view.zoom, 11) or 11) + 2)
         view.pitch = 0
         view.bearing = 0
-    st.html(_map_legend(rows))
+    st.html(_map_legend(rows, scores_comparable=scores_comparable))
     try:
         metro = _metro_rows(json.loads(_METRO_DATA.read_text(encoding="utf-8")))
     except (OSError, json.JSONDecodeError):
@@ -812,6 +816,13 @@ def _rows(listings: list[Mapping[str, Any]], base_url: str) -> list[dict[str, An
             "Оригинал": _safe_http_url(item.get("source_url")),
             "Полная стоимость": _money(item.get("estimated_monthly_total")),
             "Итог": _num(item.get("total_score")),
+            "Правила оценки": (
+                "Неизвестны"
+                if item.get("assessment_policy_known") is False
+                else "Прежние"
+                if item.get("assessment_stale")
+                else "Текущие"
+            ),
             "Допуск": {
                 "eligible": "Подходит",
                 "needs_review": "Нужно проверить",
@@ -827,23 +838,23 @@ def _rows(listings: list[Mapping[str, Any]], base_url: str) -> list[dict[str, An
 def _read_payload(
     database: str,
     listing_id: int | None = None,
-    max_scores_json: str = "{}",
-    scoring_parameters_json: str = "{}",
-    vision_contract_json: str = "[]",
+    policy_json: str = "{}",
 ) -> dict[str, Any]:
     conn = connect_db(database)
     try:
         migrate(conn)
-        max_scores = json.loads(max_scores_json)
-        scoring_parameters = json.loads(scoring_parameters_json)
-        raw_contract = json.loads(vision_contract_json)
-        vision_contract = tuple(raw_contract) if len(raw_contract) == 4 else None
+        policy = json.loads(policy_json)
+        raw_contract = policy.get("vision_contract")
+        vision_contract = (
+            tuple(raw_contract)
+            if isinstance(raw_contract, list) and len(raw_contract) == 4
+            else None
+        )
         return dashboard_payload(
             conn,
             listing_id=listing_id,
             include_inactive=True,
-            max_scores=max_scores,
-            scoring_parameters=scoring_parameters,
+            policy=policy,
             vision_contract=vision_contract,
         )
     finally:
@@ -857,82 +868,9 @@ _cached_payload = (
 )
 
 
-def _load_config(path: Path) -> Any:
-    try:
-        from flatfinder.cli import load_config
-    except ModuleNotFoundError:  # pragma: no cover
-        from .cli import load_config
-    return load_config(path)
-
-
-def _write_personal_score(config: Any, listing_id: int, score: float) -> list[str]:
-    conn = connect_db(_cfg(config, "database"))
-    try:
-        migrate(conn)
-        update_personal_score(
-            conn,
-            listing_id,
-            score,
-            max_scores=_cfg(config, "scoring_max_scores", {}),
-        )
-        try:
-            export_json(
-                conn,
-                _cfg(config, "json_export"),
-                max_scores=_cfg(config, "scoring_max_scores", {}),
-                scoring_parameters=_cfg(config, "scoring_parameters", {}),
-                vision_contract=_cfg(config, "vision_contract"),
-            )
-        except Exception as exc:
-            return [f"JSON-экспорт: {str(exc)[:500] or exc.__class__.__name__}"]
-        return []
-    finally:
-        conn.close()
-
-
-def _write_disliked(config: Any, listing_id: int, disliked: bool) -> list[str]:
-    conn = connect_db(_cfg(config, "database"))
-    try:
-        migrate(conn)
-        set_listing_disliked(conn, listing_id, disliked)
-        try:
-            export_json(
-                conn,
-                _cfg(config, "json_export"),
-                max_scores=_cfg(config, "scoring_max_scores", {}),
-                scoring_parameters=_cfg(config, "scoring_parameters", {}),
-                vision_contract=_cfg(config, "vision_contract"),
-            )
-        except Exception as exc:
-            return [f"JSON-экспорт: {str(exc)[:500] or exc.__class__.__name__}"]
-        return []
-    finally:
-        conn.close()
-
-
-def _write_favorited(config: Any, listing_id: int, favorited: bool) -> list[str]:
-    conn = connect_db(_cfg(config, "database"))
-    try:
-        migrate(conn)
-        set_listing_favorited(conn, listing_id, favorited)
-        try:
-            export_json(
-                conn,
-                _cfg(config, "json_export"),
-                max_scores=_cfg(config, "scoring_max_scores", {}),
-                scoring_parameters=_cfg(config, "scoring_parameters", {}),
-                vision_contract=_cfg(config, "vision_contract"),
-            )
-        except Exception as exc:
-            return [f"JSON-экспорт: {str(exc)[:500] or exc.__class__.__name__}"]
-        return []
-    finally:
-        conn.close()
-
-
 def _render_listing_summary(
     item: Mapping[str, Any],
-    total_max: int,
+    total_max: int | None,
     park: Mapping[str, Any],
     fitness: Mapping[str, Any],
     criteria: Mapping[str, Any],
@@ -1001,7 +939,11 @@ def _render_listing_summary(
             summary_cols,
             ("Итог", "Полная стоимость", "Площадь", "Среднее время"),
             (
-                f"{_score(item.get('total_score'), '0')}/{total_max}",
+                (
+                    f"{_score(item.get('total_score'), '0')}/{total_max}"
+                    if total_max is not None
+                    else f"{_score(item.get('total_score'), '0')} · максимум неизвестен"
+                ),
                 _money(item.get("estimated_monthly_total")),
                 f"{listing_area} м²" if listing_area != "—" else listing_area,
                 _minutes(item.get("average_commute_minutes")),
@@ -1021,7 +963,7 @@ def _render_listing_summary(
                     ):
                         st.markdown("**Парк и прогулки**")
                         st.badge(
-                            f"{_score(_map(_map(item.get('assessment')).get('park')).get('score'), '0')}/{_score(_map(criteria.get('park')).get('max'), '0')}",
+                            _criterion_score_text(item, criteria, "park", total_max is not None),
                             color="blue",
                         )
                     name = _text(park.get("place_name"), "Прогулочная зона")
@@ -1036,7 +978,7 @@ def _render_listing_summary(
                     ):
                         st.markdown("**Фитнес**")
                         st.badge(
-                            f"{_score(_map(_map(item.get('assessment')).get('fitness')).get('score'), '0')}/{_score(_map(criteria.get('fitness')).get('max'), '0')}",
+                            _criterion_score_text(item, criteria, "fitness", total_max is not None),
                             color="green",
                         )
                     name = _text(fitness.get("place_name"), "Фитнес-клуб")
@@ -1101,7 +1043,7 @@ def _render_photo_gallery(config: Any, item: Mapping[str, Any]) -> None:
 
 
 def _render_decision_controls(
-    item: Mapping[str, Any], total_max: int, personal_max: float
+    item: Mapping[str, Any], total_max: int | None, personal_max: float
 ) -> tuple[float, bool, bool, bool]:
     current_score = min(
         personal_max, max(0.0, _num(item.get("personal_score"), 0) or 0.0)
@@ -1129,7 +1071,11 @@ def _render_decision_controls(
             auto_score = _num(item.get("auto_score"), 0) or 0
             st.metric(
                 "Итог после оценки",
-                f"{_score(auto_score + personal_score, '0')}/{total_max}",
+                (
+                    f"{_score(auto_score + personal_score, '0')}/{total_max}"
+                    if total_max is not None
+                    else f"{_score(auto_score + personal_score, '0')} · максимум неизвестен"
+                ),
                 delta=f"+{personal_score}" if personal_score else None,
                 border=True,
             )
@@ -1156,6 +1102,9 @@ def _render_score_details(
     item: Mapping[str, Any],
     assessment: Mapping[str, Any],
     auto_criteria: list[tuple[str, Mapping[str, Any]]],
+    metadata: Mapping[str, Mapping[str, str]],
+    *,
+    maxima_known: bool,
 ) -> None:
     st.subheader("Детализация оценки")
     criteria_by_key = dict(auto_criteria)
@@ -1183,7 +1132,7 @@ def _render_score_details(
                 detail = _map(assessment.get(key))
                 label = (
                     _text(criterion.get("label"), "")
-                    or _CRITERION_LABELS.get(key)
+                    or _text(_map(metadata.get(key)).get("label"), "")
                     or key.replace("_", " ").strip().capitalize()
                 )
                 score_value = _num(detail.get("score"), 0) or 0
@@ -1198,7 +1147,7 @@ def _render_score_details(
                 )
                 color = (
                     "gray"
-                    if ratio == 0
+                    if not maxima_known or ratio == 0
                     else "orange"
                     if ratio < 0.5
                     else "blue"
@@ -1206,9 +1155,9 @@ def _render_score_details(
                     else "green"
                 )
                 st.badge(
-                    f"{label} — {missing_label if unknown else _score(score_value, '0') + '/' + _score(max_value, '0')}",
+                    f"{label} — {missing_label if unknown else _score(score_value, '0') + (('/' + _score(max_value, '0')) if maxima_known else '')}",
                     color=color,
-                    help=_SCORE_HELP.get(key),
+                    help=_text(_map(metadata.get(key)).get("help"), "") or None,
                     width="stretch",
                 )
 
@@ -1216,15 +1165,16 @@ def _render_score_details(
     if repair:
         scoreable = repair.get("status") == "scoreable"
         score_range = _items(repair.get("interval"))
+        repair_max = _num(_map(criteria_by_key.get("repair")).get("max"), 0) or 0
         title = (
-            f"Ремонт — {_score(repair.get('score'))}/16"
+            f"Ремонт — {_score(repair.get('score'))}{('/' + _score(repair_max, '0')) if maxima_known else ''}"
             if scoreable
             else f"Ремонт — нет данных · диапазон {_score(score_range[0] if score_range else None)}–{_score(score_range[1] if len(score_range) > 1 else None)}"
         )
         with st.expander(title, expanded=not scoreable):
             if not scoreable:
                 st.warning(
-                    "Репрезентативных фото интерьера недостаточно; результат не считается как 0/16."
+                    "Репрезентативных фото интерьера недостаточно; результат не считается нулевой оценкой."
                 )
             st.markdown(_text(repair.get("summary"), "Нет пояснения"))
             worst = _text(repair.get("worst_zone"), "")
@@ -1252,9 +1202,18 @@ def _render_listing(
     config: Any, payload: Mapping[str, Any], item: Mapping[str, Any]
 ) -> None:
     assessment = _map(item.get("assessment"))
-    rubric = _map(payload.get("rubric"))
-    total_max = int(_num(rubric.get("total_max"), 100) or 100)
+    rubric = _map(item.get("rubric")) or _map(payload.get("rubric"))
+    maxima_known = item.get("assessment_policy_known") is not False
+    total_max = (
+        int(_num(rubric.get("total_max"), 100) or 100) if maxima_known else None
+    )
     criteria = _map(rubric.get("criteria")) or rubric
+    metadata = criterion_metadata(_map(rubric.get("parameters")))
+    if not maxima_known:
+        metadata = {
+            key: {"label": _text(_map(value).get("label"), key)}
+            for key, value in metadata.items()
+        }
     auto_criteria = [
         (key, _map(criterion))
         for key, criterion in criteria.items()
@@ -1270,11 +1229,25 @@ def _render_listing(
     ]
     park = _map(item.get("park"))
     fitness = _map(item.get("fitness"))
+    if item.get("assessment_stale"):
+        reason = item.get("assessment_stale_reason")
+        if reason == "legacy_policy_unknown":
+            st.warning(
+                "Для этой сохранённой оценки неизвестны правила и максимум. "
+                "Запустите `flatfinder reassess`, чтобы пересчитать её по текущей конфигурации."
+            )
+        else:
+            st.warning(
+                "Оценка сохранена по прежней конфигурации. Ниже показаны её исходные правила и максимум. "
+                "Запустите `flatfinder reassess`, чтобы применить текущую конфигурацию."
+            )
     favorite_clicked = _render_listing_summary(item, total_max, park, fitness, criteria)
     if favorite_clicked:
         favorite = bool(item.get("favorited_at"))
         try:
-            errors = _write_favorited(config, int(item["listing_id"]), not favorite)
+            errors = record_review(
+                config, int(item["listing_id"]), favorited=not favorite
+            )
         except Exception as exc:
             st.error(str(exc)[:500] or exc.__class__.__name__)
         else:
@@ -1295,8 +1268,10 @@ def _render_listing(
     )
     if save_score:
         try:
-            errors = _write_personal_score(
-                config, int(item["listing_id"]), float(personal_score)
+            errors = record_review(
+                config,
+                int(item["listing_id"]),
+                personal_score=float(personal_score),
             )
         except Exception as exc:
             st.error(str(exc)[:500] or exc.__class__.__name__)
@@ -1311,7 +1286,9 @@ def _render_listing(
 
     if dislike_clicked:
         try:
-            errors = _write_disliked(config, int(item["listing_id"]), not disliked)
+            errors = record_review(
+                config, int(item["listing_id"]), disliked=not disliked
+            )
         except Exception as exc:
             st.error(str(exc)[:500] or exc.__class__.__name__)
         else:
@@ -1323,7 +1300,9 @@ def _render_listing(
             )
             st.rerun()
 
-    _render_score_details(item, assessment, auto_criteria)
+    _render_score_details(
+        item, assessment, auto_criteria, metadata, maxima_known=maxima_known
+    )
 
 
 def _dismiss_photo() -> None:
@@ -1413,18 +1392,22 @@ def main() -> None:
         os.environ.get("FLATFINDER_CONFIG", str(_DEFAULT_CONFIG))
     ).expanduser()
     try:
-        from flatfinder.cli import _review_listing_id as parse_listing_id
-
         listing_id = parse_listing_id(os.environ.get("FLATFINDER_LISTING_ID"))
         detail_listing_id = parse_listing_id(st.query_params.get("listing_id"))
         requested_id = listing_id if listing_id is not None else detail_listing_id
-        config = _load_config(config_path)
+        config = load_config(config_path)
+        policy = normalize_policy(
+            max_scores=_cfg(config, "scoring_max_scores", {}),
+            parameters=_cfg(config, "scoring_parameters", {}),
+            thresholds=_cfg(config, "scoring_thresholds", {}),
+            hard_constraints=_cfg(config, "hard_constraints", {}),
+            vision_scoring_enabled=bool(_cfg(config, "vision_scoring_enabled", False)),
+            vision_contract=_cfg(config, "vision_contract"),
+        )
         payload = _cached_payload(
             str(_cfg(config, "database")),
             requested_id,
-            json.dumps(_cfg(config, "scoring_max_scores", {}), sort_keys=True),
-            json.dumps(_cfg(config, "scoring_parameters", {}), sort_keys=True),
-            json.dumps(_cfg(config, "vision_contract", ())),
+            json.dumps(policy, ensure_ascii=False, sort_keys=True),
         )
     except Exception as exc:
         st.error(
@@ -1531,6 +1514,15 @@ def main() -> None:
     visible = filtered
     st.title("Квартиры к просмотру")
     st.caption(f"Выпуск: {_date(payload.get('updated_at'))}")
+    freshness = _map(payload.get("assessment_freshness"))
+    stale_count = int(_num(freshness.get("stale"), 0) or 0)
+    legacy_count = int(_num(freshness.get("legacy_unknown"), 0) or 0)
+    if stale_count or legacy_count:
+        st.warning(
+            "Часть оценок сохранена по прежним или неизвестным правилам. "
+            "Они не ранжируются и не окрашиваются вместе с актуальными. "
+            "Запустите `flatfinder reassess`, чтобы пересчитать их по текущей конфигурации."
+        )
     cols = st.columns(5)
     for col, label, value in zip(
         cols,
@@ -1572,6 +1564,7 @@ def main() -> None:
         "Оригинал": st.column_config.LinkColumn(display_text="Открыть", width="small"),
         "Полная стоимость": st.column_config.TextColumn(width="small"),
         "Итог": st.column_config.NumberColumn(width="small"),
+        "Правила оценки": st.column_config.TextColumn(width="small"),
         "Допуск": st.column_config.TextColumn(width="medium"),
         "Среднее время": st.column_config.TextColumn(width="small"),
         "Дата": st.column_config.DatetimeColumn(

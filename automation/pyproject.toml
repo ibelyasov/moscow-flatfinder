@@ -3,10 +3,10 @@ name = "flatfinder"
 version = "0.1.0"
 requires-python = ">=3.12,<3.15"
 dependencies = [
-  "crawlee[playwright]==1.9.1",
+  "crawlee[playwright]==1.10.0",
   "playwright==1.62.0",
   "Pillow==12.3.0",
-  "streamlit==1.61.1",
+  "streamlit==1.63.0",
   "osmium==4.3.1",
   "shapely==2.1.2",
 ]
@@ -15,8 +15,8 @@ dependencies = [
 flatfinder = "flatfinder.cli:main"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.32.0"]
 build-backend = "hatchling.build"
 
 [tool.uv]
-required-version = "==0.12.5"
+required-version = "==0.12.13"

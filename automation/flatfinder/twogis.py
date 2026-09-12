@@ -17,6 +17,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
+from .geo_scoring import fitness_quality, fitness_score, park_quality, park_score
 from .models import Evidence, FieldValue, ListingFacts, ValueStatus
 
 _MOSCOW = ZoneInfo("Europe/Moscow")
@@ -534,60 +535,6 @@ def apply_location_point(
     return facts
 
 
-def _clamp(value: float, lower: float = 0.0, upper: float = 1.0) -> float:
-    return max(lower, min(upper, value))
-
-
-def _smoothstep(value: float) -> float:
-    value = _clamp(value)
-    return value * value * (3 - 2 * value)
-
-
-def park_quality(area_hectares: float | None) -> float:
-    if area_hectares is None or not math.isfinite(area_hectares):
-        return 0.5
-    lower, upper = 0.3, 5.0
-    if area_hectares <= lower:
-        return 0.3
-    if area_hectares >= upper:
-        return 1.0
-    position = math.log(area_hectares / lower) / math.log(upper / lower)
-    return 0.3 + 0.7 * _smoothstep(position)
-
-
-def park_score(minutes: float | None, area_hectares: float | None) -> float:
-    if minutes is None or not math.isfinite(minutes) or minutes < 0:
-        return 0.0
-    position = _clamp((minutes - 10) / 15)
-    access = 1 - _smoothstep(position)
-    return round(9 * park_quality(area_hectares) * access, 2)
-
-
-def fitness_quality(rating: float | None, review_count: int | None) -> float:
-    if (
-        rating is None
-        or review_count is None
-        or not math.isfinite(rating)
-        or review_count < 0
-    ):
-        return 0.0
-    return _smoothstep((rating - 4.0) / 0.5) * _smoothstep(review_count / 20)
-
-
-def fitness_score(
-    minutes: float | None,
-    rating: float | None,
-    review_count: int | None,
-    sauna: bool,
-) -> float:
-    if minutes is None or not math.isfinite(minutes) or minutes < 0:
-        return 0.0
-    quality = fitness_quality(rating, review_count)
-    venue_score = 2 + 2 * quality * (1 + int(bool(sauna)))
-    access = 1 - _smoothstep((minutes - 10) / 15)
-    return round(venue_score * access, 2)
-
-
 def _coordinate_pairs(wkt: Any) -> list[tuple[float, float]]:
     if not isinstance(wkt, str):
         return []
@@ -915,16 +862,11 @@ def _route_value(payload: Mapping[str, Any]) -> dict[str, Any]:
         "service_date": payload.get("service_date"),
         "home_to_work": {
             "minutes": payload.get("home_to_work_minutes"),
-            "score": payload.get("home_to_work_score"),
         },
         "work_to_home": {
             "minutes": payload.get("work_to_home_minutes"),
-            "score": payload.get("work_to_home_score"),
         },
         "average_minutes": payload.get("average_minutes"),
-        "average_score": payload.get("average_score"),
-        "commute_score": payload.get("commute_score", 0),
-        "gate_status": payload.get("gate_status", "unknown"),
         "coordinates": {
             "lat": payload.get("home_lat"),
             "lon": payload.get("home_lon"),
@@ -933,18 +875,111 @@ def _route_value(payload: Mapping[str, Any]) -> dict[str, Any]:
             "entrance_id": payload.get("entrance_id"),
             "precision": payload.get("geocode_precision"),
         },
+        "office_coordinates": {
+            "lat": payload.get("office_lat"),
+            "lon": payload.get("office_lon"),
+        },
     }
+
+
+def _finite_measurement(
+    payload: Mapping[str, Any], key: str, lower: float, upper: float
+) -> float | None:
+    value = payload.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) and lower <= number <= upper else None
+
+
+def _valid_payload_point(payload: Mapping[str, Any], prefix: str) -> bool:
+    return (
+        _finite_measurement(payload, f"{prefix}_lat", -90, 90) is not None
+        and _finite_measurement(payload, f"{prefix}_lon", -180, 180) is not None
+    )
+
+
+def _observation_validation_error(payload: Mapping[str, Any]) -> str | None:
+    if payload.get("status") != "success":
+        return "provider status is not success"
+    if payload.get("error"):
+        return "successful observation contains an error"
+    try:
+        captured_at = datetime.fromisoformat(str(payload.get("captured_at") or ""))
+    except ValueError:
+        return "capture timestamp is invalid"
+    if captured_at.tzinfo is None:
+        return "capture timestamp has no timezone"
+    return None
+
+
+def _commute_validation_error(payload: Mapping[str, Any]) -> str | None:
+    if error := _observation_validation_error(payload):
+        return error
+    try:
+        date.fromisoformat(str(payload.get("service_date") or ""))
+    except ValueError:
+        return "service date is missing"
+    if not _valid_payload_point(payload, "home") or not _valid_payload_point(
+        payload, "office"
+    ):
+        return "home or office coordinates are invalid"
+    outbound = _finite_measurement(payload, "home_to_work_minutes", 0.01, 1440)
+    inbound = _finite_measurement(payload, "work_to_home_minutes", 0.01, 1440)
+    average = _finite_measurement(payload, "average_minutes", 0.01, 1440)
+    if outbound is None or inbound is None or average is None:
+        return "both route durations and their average are required"
+    if not math.isclose(average, (outbound + inbound) / 2, abs_tol=0.01):
+        return "average route duration is inconsistent"
+    return None
+
+
+def _place_validation_error(
+    payload: Mapping[str, Any], *, fitness: bool
+) -> str | None:
+    if error := _observation_validation_error(payload):
+        return error
+    if not str(payload.get("route_provider") or "").strip():
+        return "route provider is missing"
+    if not _valid_payload_point(payload, "home") or not _valid_payload_point(
+        payload, "place"
+    ):
+        return "home or place coordinates are invalid"
+    if not str(payload.get("place_name") or "").strip():
+        return "place name is missing"
+    if _finite_measurement(payload, "walking_minutes", 0, 1440) is None:
+        return "walking duration is invalid"
+    distance = payload.get("walking_distance_m")
+    if distance is not None and _finite_measurement(
+        payload, "walking_distance_m", 0, 1_000_000
+    ) is None:
+        return "walking distance is invalid"
+    if fitness:
+        rating = payload.get("rating")
+        if rating is not None and _finite_measurement(payload, "rating", 0, 5) is None:
+            return "fitness rating is invalid"
+        reviews = payload.get("review_count")
+        if reviews is not None:
+            count = _finite_measurement(payload, "review_count", 0, 100_000_000)
+            if count is None or not count.is_integer():
+                return "fitness review count is invalid"
+        if not isinstance(payload.get("sauna"), bool):
+            return "fitness sauna observation is invalid"
+    else:
+        area = payload.get("area_hectares")
+        if area is not None and _finite_measurement(
+            payload, "area_hectares", 0, 1_000_000
+        ) is None:
+            return "park area is invalid"
+    return None
 
 
 def apply_commute(
     facts: ListingFacts | dict[str, Any], result: CommuteResult | Mapping[str, Any]
 ) -> ListingFacts | dict[str, Any]:
     payload = result.to_payload() if isinstance(result, CommuteResult) else dict(result)
-    status = (
-        ValueStatus.CONFIRMED
-        if payload.get("status") == "success"
-        else ValueStatus.UNKNOWN
-    )
+    validation_error = _commute_validation_error(payload)
+    status = ValueStatus.CONFIRMED if validation_error is None else ValueStatus.UNKNOWN
     summary = {
         key: payload.get(key)
         for key in (
@@ -953,12 +988,21 @@ def apply_commute(
             "home_to_work_minutes",
             "work_to_home_minutes",
             "average_minutes",
+            "home_lat",
+            "home_lon",
+            "office_lat",
+            "office_lon",
+            "point_kind",
+            "building_id",
+            "entrance_id",
+            "geocode_precision",
             "average_score",
             "commute_score",
             "gate_status",
             "error",
         )
     }
+    summary["validation_error"] = validation_error
     evidence = Evidence(
         "yandex_maps_browser",
         json.dumps(summary, ensure_ascii=False, sort_keys=True),
@@ -999,11 +1043,8 @@ def apply_park(
     facts: ListingFacts | dict[str, Any], result: ParkResult | Mapping[str, Any]
 ) -> ListingFacts | dict[str, Any]:
     payload = result.to_payload() if isinstance(result, ParkResult) else dict(result)
-    status = (
-        ValueStatus.CONFIRMED
-        if payload.get("status") == "success"
-        else ValueStatus.UNKNOWN
-    )
+    validation_error = _place_validation_error(payload, fitness=False)
+    status = ValueStatus.CONFIRMED if validation_error is None else ValueStatus.UNKNOWN
     value = {
         "provider": "2gis",
         "route_provider": payload.get("route_provider", "yandex_maps"),
@@ -1015,17 +1056,21 @@ def apply_park(
             "lon": payload.get("place_lon"),
         },
         "area_hectares": payload.get("area_hectares"),
-        "quality": payload.get("quality"),
         "walking_minutes": payload.get("walking_minutes"),
         "walking_distance_m": payload.get("walking_distance_m"),
-        "score": payload.get("park_score", 0),
     }
     summary = {
         key: payload.get(key)
         for key in (
             "status",
+            "home_lat",
+            "home_lon",
+            "place_id",
             "place_name",
+            "place_lat",
+            "place_lon",
             "place_type",
+            "route_provider",
             "area_hectares",
             "quality",
             "walking_minutes",
@@ -1034,6 +1079,7 @@ def apply_park(
             "error",
         )
     }
+    summary["validation_error"] = validation_error
     evidence = Evidence(
         "2gis_api+yandex_maps_browser",
         json.dumps(summary, ensure_ascii=False, sort_keys=True),
@@ -1064,11 +1110,8 @@ def apply_fitness(
     facts: ListingFacts | dict[str, Any], result: FitnessResult | Mapping[str, Any]
 ) -> ListingFacts | dict[str, Any]:
     payload = result.to_payload() if isinstance(result, FitnessResult) else dict(result)
-    status = (
-        ValueStatus.CONFIRMED
-        if payload.get("status") == "success"
-        else ValueStatus.UNKNOWN
-    )
+    validation_error = _place_validation_error(payload, fitness=True)
+    status = ValueStatus.CONFIRMED if validation_error is None else ValueStatus.UNKNOWN
     value = {
         "provider": "2gis",
         "route_provider": payload.get("route_provider", "yandex_maps"),
@@ -1081,16 +1124,20 @@ def apply_fitness(
         "rating": payload.get("rating"),
         "review_count": payload.get("review_count"),
         "sauna": bool(payload.get("sauna", False)),
-        "quality": payload.get("quality"),
         "walking_minutes": payload.get("walking_minutes"),
         "walking_distance_m": payload.get("walking_distance_m"),
-        "score": payload.get("fitness_score", 0),
     }
     summary = {
         key: payload.get(key)
         for key in (
             "status",
+            "home_lat",
+            "home_lon",
+            "place_id",
             "place_name",
+            "place_lat",
+            "place_lon",
+            "route_provider",
             "rating",
             "review_count",
             "sauna",
@@ -1101,6 +1148,7 @@ def apply_fitness(
             "error",
         )
     }
+    summary["validation_error"] = validation_error
     evidence = Evidence(
         "2gis_api+yandex_maps_browser",
         json.dumps(summary, ensure_ascii=False, sort_keys=True),
