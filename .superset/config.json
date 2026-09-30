@@ -1,7 +1,4 @@
 {
-  "setup": [
-    "uv sync --project automation --locked",
-    "uv run --project automation playwright install chromium"
-  ],
-  "run": ["uv run --project automation flatfinder review --port 8765"]
+  "setup": ["uv sync --locked"],
+  "run": ["uv run --locked flatfinder review --port 8765"]
 }
