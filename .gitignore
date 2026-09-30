@@ -1,14 +1,13 @@
 # Private configuration and local credentials.
-/automation/config.toml
 **/config.toml
+!/examples/config.toml
 
 # Runtime state and exports.
 /data/*
-!/data/.gitkeep
 *.sqlite3
 *.sqlite3-*
 *.lock
-!/automation/uv.lock
+!/uv.lock
 /quality/vision-calibration-journal.json
 /quality/*manifest*.json
 
@@ -35,3 +34,6 @@ __pycache__/
 
 # Personal Superset lifecycle overrides.
 .superset/config.local.json
+
+# Temporary plans and verification artifacts.
+/.work/

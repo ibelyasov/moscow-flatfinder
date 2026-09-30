@@ -44,8 +44,9 @@ Each listing explains the score and still leaves room for personal judgment.
 
 ![Apartment score details](docs/images/listing.png)
 
-The screenshots come from the real workflow with synthetic demo listings and no
-personal addresses, links, coordinates, or third-party photos.
+These screenshots illustrate the earlier interface. For a new demo,
+`tools/generate_demo.py` creates a database entirely from invented listings,
+without reading a private database or photos.
 
 ## How it works
 
@@ -62,11 +63,17 @@ personal addresses, links, coordinates, or third-party photos.
 - **Personal criteria, not a universal rating.** Score weights, thresholds, and
   maximum points live in the local config.
 - **Hard requirements stay hard.** A listing is eligible, needs review because a
-  fact is missing, or is rejected because a known requirement fails.
+  fact is missing, or is rejected because a confirmed requirement fails. Estimated
+  costs affect soft ranking with partial confidence; they never silently prove a
+  hard budget requirement.
 - **Unknown is not the same as bad.** Missing evidence stays visible instead of
   quietly turning into a zero.
 - **The score does not have to total 100.** Disabled criteria disappear from the
   denominator, so a setup can use `34/49`, `54/66`, or any other useful maximum.
+- **Offers stay independent.** Duplicate links never hide another offer or
+  transfer its manual score, favorite, or dislike.
+- **Vision has a human decision.** Photo analysis is pending until accepted;
+  automatic acceptance requires an explicit config choice.
 - **The decision stays inspectable.** The interface shows the contribution of
   price, apartment, commute, surroundings, and photos instead of only a total.
 
@@ -117,30 +124,79 @@ The intended path is:
 ## What is under the hood
 
 The core works without API keys and includes Yandex Realty and CIAN collection,
-deduplication, SQLite history, deterministic JSON export, and a local Streamlit
-review interface.
+reversible cross-source duplicate links, SQLite observations, deterministic JSON
+export, and a local Streamlit review interface.
 
 Optional modules add:
 
 - **Geo** — 2GIS places and geocoding plus Yandex Maps commute routes;
 - **Noise** — a local OpenStreetMap layer for roads and railways;
 - **Vision** — Codex CLI or Claude CLI for renovation, layout, natural light,
-  and view assessment. The model is configurable; the recommended profile is
-  Codex with `gpt-5.6-luna` and `medium` effort.
+  and view assessment. Provider, model and effort are explicit local choices.
 
-The application is a modular Python monolith. `config` validates settings without
-accessing credentials. `assessment` builds one decision from facts and a scoring
-policy; collection and reassessment use the same calculation. `application`
-owns user operations, while `pipeline` owns the durable browser queue and returns
-one outcome per processed listing. `vision_workflow` owns persisted photo analysis.
-SQLite writes live in `storage`, workflow queries in `queries`, and the batched
-`read_model` supplies both Streamlit and deterministic JSON serialization.
+The application is a modular Python monolith under `src/flatfinder`. `config`
+validates the current TOML without accessing credentials. `application` owns user
+operations, `collection` runs Playwright sequentially, and `assessment` calculates
+one full decision from typed facts and an explicit policy. `database` owns SQL,
+schema validation and atomic writes; `read_model` supplies the same view to `ui`
+and deterministic JSON export. One current observation and one ordered photo set
+are authoritative. Restarting collection repeats discovery; completed observations
+remain saved, and presence is tracked separately for each search.
 
-Each new assessment records its scoring policy. Changing the config marks older
-assessments as stale; opening the review interface does not recalculate them.
-Run `flatfinder reassess` to recalculate all active listings from saved facts, or
-`flatfinder reassess 123` for one internal listing ID. This does not collect pages,
-request routes, or run Vision. Manual ratings and favorites are preserved.
+Each assessment stores its policy. Config or effective Vision prompt changes
+make older assessments stale; review never recalculates them. Use explicit
+`reassess` from saved facts. It preserves manual decisions and makes no provider
+calls. Geo/Noise facts retain their acquisition context; pure reassessment cannot
+confirm measurements for a changed destination, departure time or Noise map.
+`enrich [ID] [--force]` acquires enabled Geo/Noise measurements;
+`vision ID [--force]` analyzes one current gallery, and
+`vision-review RUN_ID --accept` or `--reject` records the human decision.
+
+`--config` is a global option, placed before the command:
+
+```sh
+uv run --locked flatfinder --config "/path/to/private/config.toml" doctor
+uv run --locked flatfinder --config "/path/to/private/config.toml" reassess 123
+uv run --locked flatfinder --config "/path/to/private/config.toml" review --port 8765
+```
+
+Review listens on loopback. It does not hold the writer lock for its entire
+lifetime; mutations acquire the lock for their operation. `doctor` checks local
+files and schema without browser, credentials or inference; it does not prove
+provider authentication or live collection readiness.
+
+### Database and offline tools
+
+Normal startup accepts schema 18 only and never migrates schema 17. `init`
+explicitly creates a new database. To prepare an offline import, keep the v17
+source closed with no pending WAL/journal and choose a separate, nonexistent target:
+
+```sh
+uv run --locked python tools/import_v17.py --source /path/to/closed-v17.sqlite3 --target /path/to/new-v18.sqlite3
+uv run --locked python tools/generate_demo.py --target /path/to/new-demo.sqlite3
+```
+
+The importer reads the source without changing it and publishes a checked new
+target atomically without overwrite. IDs and manual decisions are preserved;
+current facts come from the saved current hash, with all original records retained
+in a technical archive. Old Geo, Vision, assessments and search presence are not
+promoted to verified current contracts. Lost recurrence chronology cannot be
+reconstructed. Supply `--photo-root /path/to/same-runtime/photos` explicitly to
+retain contained local references; otherwise paths and metadata remain archived,
+and current photos require download. Files are never copied. The import policy
+keeps enough personal points to preserve every old manual score and reports its
+fingerprint. Import preparation does not switch the live config or runtime.
+
+Noise uses a version 2 map with explicitly declared complete coverage bounds.
+Outside coverage or with an incompatible map, its result stays unknown. Map
+rebuild is a separately approved operation; install its optional dependencies with
+`uv sync --locked --extra noise`. See the configuration reference for the command.
+
+Backups are explicit: `flatfinder backup` creates a verified SQLite backup;
+`backup --keep N` additionally prunes older backups. Collection never creates or
+prunes backups automatically. Live migration, runtime switching, provider work,
+full collection, mass Vision refresh, schedules and backup/prune operations retain
+their separate approval boundaries.
 
 ## Privacy and limits
 
@@ -157,7 +213,7 @@ human one.
 
 ## Tech stack
 
-Python, `uv`, Crawlee, Playwright, Chromium, SQLite, Streamlit, PyDeck, Pillow,
+Python, `uv`, Playwright, Chromium, SQLite, Streamlit, PyDeck, Pillow,
 2GIS, Yandex Maps, OpenStreetMap, osmium, Shapely, Codex CLI, and Claude CLI.
 
 ## Documentation
@@ -166,40 +222,38 @@ Python, `uv`, Crawlee, Playwright, Chromium, SQLite, Streamlit, PyDeck, Pillow,
   personal search.
 - [Configuration reference](docs/configuration.md) — capabilities, scoring,
   hard requirements, Vision, paths, and secrets.
-- [Search case study](docs/case-study.md) — how the neighborhood search evolved
-  in practice (in Russian).
+- [Search case study](docs/case-study.md) — historical record of how the
+  neighborhood search evolved in practice (in Russian).
 
 <details>
 <summary>Development checks</summary>
 
 The project deliberately has no permanent test framework. From the repository
-root, run:
+root, run the checks below; SQLite verification uses an isolated synthetic database,
+never the personal runtime:
 
 ```sh
-uv sync --project automation --locked
-uv run --project automation python -m compileall -q automation/flatfinder
-PYTHONPATH=automation uv run --project automation python -c \
-  'from flatfinder import admin, application, assessment, cli, config, export, photos, pipeline, queries, read_model, scoring, storage, vision, vision_workflow; from flatfinder.sources import cian, yandex_realty'
-uv run --project automation flatfinder --help
-sqlite3 "$HOME/Library/Application Support/MoscowFlatFinder/data/listings.sqlite3" \
-  'PRAGMA integrity_check;'
+uv sync --locked --extra noise
+.venv/bin/python -m compileall -q src/flatfinder tools
+.venv/bin/python -c 'import importlib, pkgutil, flatfinder; [importlib.import_module(m.name) for m in pkgutil.walk_packages(flatfinder.__path__, flatfinder.__name__ + ".")]'
+.venv/bin/flatfinder --help
+.venv/bin/flatfinder reassess --help
+.venv/bin/python -c 'from flatfinder.database import Database; d=Database.initialize(":memory:"); assert d.health()["ok"]; d.close()'
+.venv/bin/python -c 'from flatfinder.config import load_config; from flatfinder.scoring import score_maxima; c=load_config("examples/config.toml"); assert score_maxima(c.policy["max_scores"]) == (39.0, 10.0, 49.0)'
 git diff --check
 ```
 
-When the required `uv` version is unavailable but the locked environment already
-exists, the same Python checks can run with `automation/.venv/bin/python` and
-`PYTHONPATH=automation`; CLI smoke uses `python -m flatfinder.cli --help`. This
-checks the code in that environment and does not validate a fresh dependency sync.
-Use temporary synthetic SQLite databases for refactor checks, including policy
-changes, reassessment, preserved manual decisions, and transaction rollback.
+CI runs the same checks on Python 3.12, 3.13 and 3.14, without installing Chromium
+or calling providers. This verifies source and local contracts, not browser or
+live runtime acceptance. Keep focused temporary smoke scripts, synthetic SQLite
+fixtures, logs and timings outside Git. If using an existing interpreter directly,
+set `PYTHONPATH=src` and use `python -B`; the supported commands and examples live
+at the repository root. Root dependency sync is a separate check from using an
+already installed environment; the checks use it directly without repeating sync.
 
-The supported entrypoint is the `flatfinder` CLI. Internal Python imports changed
-in the architecture refactor: use `flatfinder.sources.cian` and
-`flatfinder.sources.yandex_realty` instead of the removed root `cian`/`extract`
-facades. Shared parsing guards live in `flatfinder.sources.common`; discovery
-uses `adapter.extract_search_page(page)` and its `.links` result instead of
-`extract_offer_links`. Configuration is in `flatfinder.config`, and persisted
-Vision operations are in `flatfinder.vision_workflow`.
+CI also builds a tiny generated local OSM layer through the application command
+boundary. The `noise` extra adds only its native parser; no map download, browser
+installation, provider call, service or VM is part of verification.
 
 </details>
 

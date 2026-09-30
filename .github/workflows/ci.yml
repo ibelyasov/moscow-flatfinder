@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -15,46 +17,82 @@ jobs:
   verify:
     name: Verify Python ${{ matrix.python }}
     runs-on: macos-15
-    timeout-minutes: 35
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
         python: ["3.12", "3.13", "3.14"]
-
     steps:
-      - name: Checkout full history
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.19"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install Python and dependencies once
+        run: uv sync --locked --extra noise --python ${{ matrix.python }}
+      - name: Verify production imports, CLI and behavior
+        run: |
+          .venv/bin/python -m compileall -q src/flatfinder tools
+          .venv/bin/python -c 'import importlib, pkgutil, flatfinder; [importlib.import_module(m.name) for m in pkgutil.walk_packages(flatfinder.__path__, flatfinder.__name__ + ".")]'
+          .venv/bin/flatfinder --help
+          .venv/bin/flatfinder reassess --help
+          .venv/bin/python - <<'PY'
+          from copy import deepcopy
+          from dataclasses import replace
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+          from flatfinder.application import refresh_noise_map
+          from flatfinder.assessment import evaluate_listing
+          from flatfinder.config import load_config
+          from flatfinder.database import Database
+          from flatfinder.models import FieldValue, ListingFacts, ValueStatus
+          from flatfinder.scoring import score_maxima
+          from flatfinder.scoring_policy import normalize_policy
+          policy = load_config("examples/config.toml").policy
+          assert score_maxima(policy["max_scores"]) == (39.0, 10.0, 49.0)
+          facts = ListingFacts(source="cian", source_listing_id="123", source_url="https://www.cian.ru/rent/flat/123/", fields={"price_monthly": FieldValue(70000, ValueStatus.CONFIRMED)})
+          with TemporaryDirectory() as directory:
+              with Database.initialize(Path(directory) / "fixture.sqlite3") as db:
+                  identifier = db.save_observation(facts, "fixture", policy)
+                  changed = deepcopy(facts)
+                  changed.fields["price_monthly"].value = 80000
+                  db.save_observation(changed, "fixture", policy)
+                  db.save_observation(facts, "fixture", policy)
+                  assert db.listing(identifier)["facts"].fields["price_monthly"].value == 70000
+                  assert len(db.observation_history(identifier)) == 3
+                  db.record_review(identifier, policy=policy, favorite=True, personal_score=7.5)
+                  assert db.listing(identifier)["favorite"]
+                  assert db.listing(identifier)["personal_score"] == 7.5
+                  assert db.health()["ok"]
+          with TemporaryDirectory() as directory:
+              root = Path(directory)
+              source = root / "generated.osm"
+              source.write_text('<osm version="0.6"><node id="1" lat="55.75" lon="37.6"/><node id="2" lat="55.751" lon="37.6"/><way id="3"><nd ref="1"/><nd ref="2"/><tag k="highway" v="primary"/></way></osm>')
+              config = load_config("examples/config.toml")
+              config = replace(config, runtime_dir=root, noise_enabled=True, paths=replace(config.paths, noise_map=root / "map.json", lock=root / "lock"))
+              result = refresh_noise_map(config, str(source), (37.5, 55.6, 37.7, 55.9))
+              assert result["features"] == 1 and result["schema_version"] == 2
+              assert result["coverage_complete"]
+          constrained = normalize_policy(max_scores=policy["max_scores"], hard_constraints={"max_monthly_total": 100000})
+          assert evaluate_listing(facts, policy=constrained).assessment["eligibility"]["status"] == "needs_review"
+          PY
+          git diff --check
+  secrets:
+    name: Scan complete history for secrets
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Checkout complete history
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Install pinned uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
-        with:
-          version: "0.12.13"
-          enable-cache: true
-          cache-dependency-glob: automation/uv.lock
-
-      - name: Install Python and dependencies
-        run: |
-          uv python install ${{ matrix.python }}
-          uv sync --project automation --locked --python ${{ matrix.python }}
-          uv run --project automation playwright install chromium
-
-      - name: Verify Python and CLI
-        env:
-          PYTHONPATH: automation
-        run: |
-          uv run --project automation python -m compileall -q automation/flatfinder
-          uv run --project automation python -c 'import importlib, pkgutil, flatfinder; [importlib.import_module(m.name) for m in pkgutil.walk_packages(flatfinder.__path__, flatfinder.__name__ + ".")]'
-          uv run --project automation flatfinder --help
-          uv run --project automation flatfinder reassess --help
-          uv run --project automation python -c 'import sqlite3; from flatfinder.storage import migrate; c=sqlite3.connect(":memory:"); migrate(c); assert c.execute("PRAGMA integrity_check").fetchone()[0] == "ok"; assert c.execute("PRAGMA user_version").fetchone()[0] == 17'
-          uv run --project automation python -c 'from flatfinder.config import load_config; from flatfinder.scoring import score_maxima; c=load_config("automation/config.example.toml"); assert score_maxima(c.scoring_max_scores) == (39.0, 10.0, 49.0)'
-          git diff --check
-
-      - name: Scan complete history for secrets
-        if: matrix.python == '3.13'
+      - name: Scan secrets
         run: |
           brew install gitleaks
           gitleaks git --redact --no-banner --log-opts="--all" .

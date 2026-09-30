@@ -1,0 +1,27 @@
+[project]
+name = "flatfinder"
+version = "0.1.0"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+  "playwright==1.62.0",
+  "Pillow==12.3.0",
+  "streamlit==1.63.0",
+  "pydeck==0.9.3",
+  "shapely==2.1.2",
+]
+
+[project.optional-dependencies]
+noise = ["osmium==4.3.1"]
+
+[project.scripts]
+flatfinder = "flatfinder.cli:main"
+
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flatfinder"]
+
+[tool.uv]
+required-version = ">=0.12.13,<0.13"

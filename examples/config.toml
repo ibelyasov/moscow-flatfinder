@@ -1,0 +1,101 @@
+# Агент копирует этот файл в локальный runtime-каталог и заполняет его вместе
+# с пользователем. Адреса, URL поисков и ключи не должны попадать в Git.
+
+runtime_dir = "~/Library/Application Support/MoscowFlatFinder"
+
+[paths]
+database = "data/listings.sqlite3"
+export = "exports/listings.json"
+noise_map = "data/moscow-transport-noise.json"
+browser_profile = "browser-profile"
+photos = "photos"
+vision_prompt = "vision-prompt.toml"
+search_profile = "search-profile.md"
+lock = "flatfinder.lock"
+
+[collection]
+max_listings = 250
+retries = 5
+headed = true
+timeout_seconds = 120
+
+[capabilities]
+# Core (парсинг, SQLite, базовый рейтинг и UI) включён всегда.
+geo = false
+noise = false
+vision = false
+
+[geo]
+destination = "<адрес назначения>"
+# По умолчанию ключ читается из macOS Keychain. Альтернативный явный способ —
+# twogis_api_key в частном config.toml вне Git.
+keychain_service = "MoscowFlatFinder.2GIS"
+keychain_account = "<имя локальной учётной записи>"
+
+# Яндекс Карты открываются последовательно в том же persistent browser.
+min_interval_seconds = 30
+jitter_seconds = 10
+timeout_seconds = 120
+departure_weekday = 1 # вторник; 0..6 (понедельник..воскресенье)
+to_work_time = "09:00"
+to_home_time = "19:00"
+
+[vision]
+provider = "codex" # codex или claude
+model = "gpt-5.6-luna"
+reasoning_effort = "medium"
+scoring_enabled = false
+auto_accept = false
+binary = "codex"
+timeout_seconds = 900
+
+[scoring.max_points]
+noise = 6
+park = 9
+equipment = 15
+repair = 16
+price = 16
+commute = 9
+area = 4
+visual_layout = 3
+floor = 2
+light_view = 2
+building = 2
+fitness = 6
+personal = 10
+
+[scoring.thresholds]
+# Для Core automatic max = 39. Агент пересчитает пороги при включении модулей.
+priority = 32
+good = 27
+reserve = 22
+
+[scoring.parameters]
+# Формулы фиксированы в коде; здесь меняются только понятные опорные значения.
+price_best_monthly_total = 90000
+price_zero_monthly_total = 115000
+commission_amortization_months = 12
+utilities_meters_monthly = 2500
+utilities_full_bill_monthly = 10000
+commute_best_minutes = 25
+commute_zero_minutes = 45
+area_start_m2 = 35
+area_good_m2 = 40
+area_full_m2 = 50
+
+[hard_constraints]
+# Поддерживается только этот фиксированный набор. Неизвестное значение у
+# объявления даёт needs_review, явное нарушение — rejected.
+# max_monthly_total = 100000
+# min_area_m2 = 40
+# min_floor = 2
+# max_commute_minutes = 35
+# min_repair_score = 8
+# required_equipment = ["furnished", "fridge", "washer"]
+
+# Добавьте один или оба разрешённых источника. Источник определяется по URL.
+[[searches]]
+url = "https://realty.yandex.ru/replace-with-search-url"
+
+[[searches]]
+url = "https://www.cian.ru/replace-with-search-url"
