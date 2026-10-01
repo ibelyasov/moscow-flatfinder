@@ -225,6 +225,24 @@ Python, `uv`, Playwright, Chromium, SQLite, Streamlit, PyDeck, Pillow,
 - [Search case study](docs/case-study.md) — historical record of how the
   neighborhood search evolved in practice (in Russian).
 
+### Code navigation with CodeGraph
+
+With [CodeGraph](https://github.com/colbymchenry/codegraph) installed and its MCP
+server connected to your agent, initialize the local index from the repository
+root:
+
+```sh
+codegraph init --yes .
+codegraph status .
+codegraph query Database
+```
+
+The generated `.codegraph/` directory stays outside Git. The index respects
+`.gitignore`, including the Python environment and temporary `.work/` artifacts.
+For MCP queries, pass this checkout's absolute path as `projectPath`. The MCP
+server watches queried projects for changes; `codegraph sync .` also updates the
+index explicitly when using the CLI.
+
 <details>
 <summary>Development checks</summary>
 

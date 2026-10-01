@@ -32,6 +32,9 @@ __pycache__/
 .idea/
 .vscode/
 
+# Local CodeGraph index and process state.
+/.codegraph/
+
 # Personal Superset lifecycle overrides.
 .superset/config.local.json
 
